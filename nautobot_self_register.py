@@ -591,6 +591,14 @@ def lookup_role(client: NautobotClient, name: str) -> dict[str, Any] | None:
     return lookup_by_name(client, "/api/extras/roles/", name)
 
 
+def lookup_device_type(client: NautobotClient, value: str) -> dict[str, Any] | None:
+    for query_key in ("model", "slug"):
+        found = first_api_result(client.get("/api/dcim/device-types/", {query_key: value}))
+        if found:
+            return found
+    return None
+
+
 def get_token(config: dict[str, Any]) -> str:
     token_env = config.get("token_env", "NAUTOBOT_TOKEN")
     token = os.environ.get(str(token_env)) if token_env else None
@@ -625,6 +633,23 @@ def get_role_name(config: dict[str, Any], inventory: dict[str, Any]) -> str:
     return default_role
 
 
+def make_ai_resource_summary(config: dict[str, Any], inventory: dict[str, Any]) -> str:
+    fields = {
+        "host": config.get("device_name") or inventory.get("hostname"),
+        "os": f"{inventory.get('os_name')} {inventory.get('os_version')}".strip(),
+        "arch": inventory.get("architecture"),
+        "cpu": inventory.get("cpu_model"),
+        "cores": inventory.get("cpu_logical_cores"),
+        "memory_gb": inventory.get("memory_gb"),
+        "disk_gb": inventory.get("disk_total_gb"),
+        "role": get_role_name(config, inventory),
+        "location": config.get("location"),
+        "purpose": config.get("purpose"),
+        "ip": inventory.get("primary_ip_address"),
+    }
+    return "; ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
+
+
 def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
     raw = {
         "hostname": inventory.get("hostname"),
@@ -644,13 +669,15 @@ def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dic
         "architecture": inventory.get("architecture"),
         "cpu_model": inventory.get("cpu_model"),
         "cpu_cores": inventory.get("cpu_logical_cores"),
-        "memory_gb": inventory.get("memory_gb"),
-        "disk_total_gb": inventory.get("disk_total_gb"),
+        "memory_gb": str(inventory["memory_gb"]) if inventory.get("memory_gb") is not None else None,
+        "disk_total_gb": str(inventory["disk_total_gb"]) if inventory.get("disk_total_gb") is not None else None,
         "serial_number": inventory.get("serial_number"),
         "primary_mac_address": inventory.get("primary_mac_address"),
         "primary_ip_address": inventory.get("primary_ip_address"),
         "inventory_source": inventory.get("inventory_source"),
-        "inventory_raw_json": json.dumps(raw, ensure_ascii=False, sort_keys=True),
+        "ai_resource_summary": make_ai_resource_summary(config, inventory),
+        "agent_task_state": config.get("agent_task_state"),
+        "inventory_raw_json": raw,
     }
     extra = config.get("custom_fields")
     if isinstance(extra, dict):
@@ -678,7 +705,7 @@ def resolve_required_objects(
         manufacturer = lookup_by_name(client, "/api/dcim/manufacturers/", "Generic")
 
     device_type_name = str(config.get("device_type") or inventory.get("device_type"))
-    device_type = lookup_by_name(client, "/api/dcim/device-types/", device_type_name)
+    device_type = lookup_device_type(client, device_type_name)
     tags = []
     for tag_name in config.get("tags") or []:
         tag = lookup_by_name(client, "/api/extras/tags/", str(tag_name))
