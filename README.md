@@ -8,6 +8,8 @@ This repository contains scripts that run on individual hosts.
 
 The Nautobot-side Job and seed data live in the separate `nauto` repository. Run that Job first so the required Nautobot objects exist before hosts self-register.
 
+Collected inventory includes OS, CPU, memory, disk, network, and best-effort GPU accelerator details. NVIDIA GPUs are read with `nvidia-smi` when available; Linux falls back to `lspci` for generic display/accelerator detection, and macOS uses `system_profiler SPDisplaysDataType`. Missing GPU tools do not fail registration.
+
 ## Supported Hosts
 
 - Ubuntu / Linux
@@ -23,6 +25,12 @@ uv sync
 ```
 
 If you install dependencies directly with `pip`, install `psutil` and `PyYAML`.
+
+GPU detection uses host commands when present. Install `pciutils` on Linux if you want the generic `lspci` fallback:
+
+```bash
+sudo apt install pciutils
+```
 
 ## Configuration
 

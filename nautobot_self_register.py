@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -240,6 +241,177 @@ def get_memory_gb() -> float | None:
     return None
 
 
+def normalize_mib_to_gb(mib_value: float | int | str | None) -> float | None:
+    if mib_value in (None, ""):
+        return None
+    try:
+        return round(float(mib_value) / 1024, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_gpu_memory_gb(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"([\d.]+)\s*(GB|GiB|MB|MiB)", text, re.IGNORECASE)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit in {"gb", "gib"}:
+        return round(value, 2)
+    return normalize_mib_to_gb(value)
+
+
+def get_linux_nvidia_gpus() -> tuple[bool, list[dict[str, Any]]]:
+    output = run_command(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=8,
+    )
+    if output is None:
+        return False, []
+
+    gpus: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if not parts or not parts[0]:
+            continue
+        memory_gb = normalize_mib_to_gb(parts[1]) if len(parts) > 1 else None
+        gpus.append(
+            {
+                "name": parts[0],
+                "vendor": "NVIDIA",
+                "memory_gb": memory_gb,
+                "driver_version": parts[2] if len(parts) > 2 and parts[2] else None,
+                "source": "nvidia-smi",
+            }
+        )
+    return True, gpus
+
+
+def get_linux_lspci_gpus(existing_names: set[str] | None = None) -> tuple[bool, list[dict[str, Any]]]:
+    output = run_command(["lspci", "-mm"], timeout=8)
+    if output is None:
+        return False, []
+
+    existing = {name.lower() for name in existing_names or set()}
+    gpus: list[dict[str, Any]] = []
+    gpu_classes = ("vga compatible controller", "3d controller", "display controller")
+    for line in output.splitlines():
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            continue
+        if len(parts) < 3:
+            continue
+        device_class = parts[1].lower()
+        if not any(gpu_class in device_class for gpu_class in gpu_classes):
+            continue
+        vendor = parts[2]
+        model = parts[3] if len(parts) > 3 else vendor
+        name = f"{vendor} {model}".strip()
+        if name.lower() in existing or model.lower() in existing:
+            continue
+        gpus.append(
+            {
+                "name": name,
+                "vendor": vendor,
+                "memory_gb": None,
+                "source": "lspci",
+            }
+        )
+    return True, gpus
+
+
+def get_macos_gpus() -> tuple[bool, list[dict[str, Any]]]:
+    output = run_command(["system_profiler", "SPDisplaysDataType"], timeout=20)
+    if output is None:
+        return False, []
+
+    gpus: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        if key in {"Chipset Model", "Model"} and value:
+            if current and current.get("name"):
+                gpus.append(current)
+            current = {
+                "name": value,
+                "vendor": "Apple" if value.startswith("Apple ") else None,
+                "memory_gb": None,
+                "source": "system_profiler",
+            }
+            continue
+        if current is None:
+            continue
+        if key == "Vendor" and value:
+            current["vendor"] = value
+        elif key.startswith("VRAM") and value:
+            current["memory"] = value
+            current["memory_gb"] = parse_gpu_memory_gb(value)
+        elif key == "Metal Support" and value:
+            current["metal_support"] = value
+
+    if current and current.get("name"):
+        gpus.append(current)
+    return True, gpus
+
+
+def summarize_gpus(gpus: list[dict[str, Any]], detected: bool) -> dict[str, Any]:
+    models = [str(gpu.get("name")) for gpu in gpus if gpu.get("name")]
+    memory_values = [gpu.get("memory_gb") for gpu in gpus if isinstance(gpu.get("memory_gb"), (int, float))]
+    total_memory_gb = round(sum(float(value) for value in memory_values), 2) if memory_values else None
+
+    summary_fields = {
+        "count": len(gpus) if detected else None,
+        "models": ", ".join(models) if models else None,
+        "memory_gb": total_memory_gb,
+    }
+    accelerator_summary = "; ".join(
+        f"{key}={value}" for key, value in summary_fields.items() if value not in (None, "")
+    )
+    return {
+        "detected": detected,
+        "gpus": gpus,
+        "count": summary_fields["count"],
+        "models": summary_fields["models"],
+        "memory_gb": total_memory_gb,
+        "accelerator_summary": accelerator_summary or None,
+    }
+
+
+def get_gpu_summary(system: str) -> dict[str, Any]:
+    detected = False
+    gpus: list[dict[str, Any]] = []
+
+    if system == "Linux":
+        nvidia_detected, nvidia_gpus = get_linux_nvidia_gpus()
+        detected = detected or nvidia_detected
+        gpus.extend(nvidia_gpus)
+
+        existing_names = {str(gpu.get("name")) for gpu in gpus if gpu.get("name")}
+        lspci_detected, lspci_gpus = get_linux_lspci_gpus(existing_names)
+        detected = detected or lspci_detected
+        if nvidia_gpus:
+            lspci_gpus = [
+                gpu
+                for gpu in lspci_gpus
+                if "nvidia" not in f"{gpu.get('vendor', '')} {gpu.get('name', '')}".lower()
+            ]
+        gpus.extend(lspci_gpus)
+    elif system == "Darwin":
+        detected, gpus = get_macos_gpus()
+
+    return summarize_gpus(gpus, detected)
+
+
 def get_disk_summary() -> dict[str, Any]:
     total = used = free = None
     try:
@@ -451,6 +623,7 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
     interfaces = get_interfaces()
     primary_interface = choose_primary_interface(interfaces, primary_ip)
     disk_summary = get_disk_summary()
+    gpu_summary = get_gpu_summary(system)
 
     cpu_physical = psutil.cpu_count(logical=False) if psutil is not None else None
     cpu_logical = psutil.cpu_count(logical=True) if psutil is not None else os.cpu_count()
@@ -478,6 +651,11 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         "cpu_physical_cores": cpu_physical,
         "cpu_logical_cores": cpu_logical,
         "memory_gb": get_memory_gb(),
+        "gpu": gpu_summary,
+        "gpu_count": gpu_summary.get("count"),
+        "gpu_models": gpu_summary.get("models"),
+        "gpu_memory_gb": gpu_summary.get("memory_gb"),
+        "gpu_accelerator_summary": gpu_summary.get("accelerator_summary"),
         "disk": disk_summary,
         "disk_total_gb": disk_summary.get("root_total_gb"),
         "interfaces": interfaces,
@@ -641,6 +819,7 @@ def make_ai_resource_summary(config: dict[str, Any], inventory: dict[str, Any]) 
         "cpu": inventory.get("cpu_model"),
         "cores": inventory.get("cpu_logical_cores"),
         "memory_gb": inventory.get("memory_gb"),
+        "gpu": inventory.get("gpu_accelerator_summary"),
         "disk_gb": inventory.get("disk_total_gb"),
         "role": get_role_name(config, inventory),
         "location": config.get("location"),
@@ -655,6 +834,7 @@ def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dic
         "hostname": inventory.get("hostname"),
         "fqdn": inventory.get("fqdn"),
         "hardware": inventory.get("hardware"),
+        "gpu": inventory.get("gpu"),
         "disk": inventory.get("disk"),
         "primary_interface": inventory.get("primary_interface"),
         "software": inventory.get("software"),
@@ -670,6 +850,10 @@ def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dic
         "cpu_model": inventory.get("cpu_model"),
         "cpu_cores": inventory.get("cpu_logical_cores"),
         "memory_gb": str(inventory["memory_gb"]) if inventory.get("memory_gb") is not None else None,
+        "gpu_count": inventory.get("gpu_count"),
+        "gpu_models": inventory.get("gpu_models"),
+        "gpu_memory_gb": str(inventory["gpu_memory_gb"]) if inventory.get("gpu_memory_gb") is not None else None,
+        "gpu_accelerator_summary": inventory.get("gpu_accelerator_summary"),
         "disk_total_gb": str(inventory["disk_total_gb"]) if inventory.get("disk_total_gb") is not None else None,
         "serial_number": inventory.get("serial_number"),
         "primary_mac_address": inventory.get("primary_mac_address"),
