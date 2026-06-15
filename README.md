@@ -8,7 +8,9 @@ This repository contains scripts that run on individual hosts.
 
 The Nautobot-side Job and seed data live in the separate `nauto` repository. Run that Job first so the required Nautobot objects exist before hosts self-register.
 
-Collected inventory includes OS, CPU, memory, disk, network, and best-effort GPU accelerator details. NVIDIA GPUs are read with `nvidia-smi` when available; Linux falls back to `lspci` for generic display/accelerator detection, and macOS uses `system_profiler SPDisplaysDataType`. Missing GPU tools do not fail registration.
+Collected inventory includes OS, CPU, memory, disk, network, best-effort GPU accelerator details, and a lightweight Docker/service placement snapshot. NVIDIA GPUs are read with `nvidia-smi` when available; Linux falls back to `lspci` for generic display/accelerator detection, and macOS uses `system_profiler SPDisplaysDataType`. Missing GPU or Docker tools do not fail registration.
+
+Docker collection is intentionally limited to scheduler-facing facts such as engine availability, container counts, compose projects, published ports, and important service containers like `ollama`, `vllm`, `open-webui`, `nautobot`, `grafana`, `prometheus`, `postgres`, and `redis`. The script does not collect container environment variables, logs, secret contents, or bind-mounted file contents.
 
 ## Supported Hosts
 
@@ -31,6 +33,16 @@ GPU detection uses host commands when present. Install `pciutils` on Linux if yo
 ```bash
 sudo apt install pciutils
 ```
+
+Docker detection uses the local `docker` CLI when present:
+
+```bash
+docker version --format json
+docker ps -a --format '{{json .}}'
+docker compose ls --format json
+```
+
+The user running the script must have permission to talk to the Docker socket for Docker facts to be collected. If Docker is unavailable or permission is denied, self-registration continues with `docker_engine_state` set to an unavailable state.
 
 ## Configuration
 
@@ -56,6 +68,24 @@ Create `self_inventory.yaml` only when you need local overrides:
 cp example.self_inventory.yaml self_inventory.yaml
 editor self_inventory.yaml
 ```
+
+Use `service_roles` and `preferred_services` in `self_inventory.yaml` for stable service placement declarations. For example, a host that should normally serve local Ollama requests can declare:
+
+```yaml
+service_roles:
+  - ai-inference
+
+preferred_services:
+  ollama:
+    service_role: ai-inference
+    preferred: true
+    endpoint: "http://pc1:11434"
+    startup_policy: use_existing_first
+    fallback_policy: start_new_if_capacity_available
+    managed_by: systemd
+```
+
+These fields describe intended placement and preferred endpoints. Live capacity, such as GPU utilization or VRAM pressure, should be checked through monitoring before dispatching work.
 
 Provide `NAUTOBOT_URL` and `NAUTOBOT_TOKEN` via `.env` or shell environment variables. When using `.env`, load it with `uv run --env-file .env ...`. Do not store API tokens directly in `self_inventory.yaml`.
 

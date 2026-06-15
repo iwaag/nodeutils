@@ -48,6 +48,16 @@ DEFAULT_ROLE_BY_SYSTEM = {
     "Linux": "linux-workstation",
     "Darwin": "macos-workstation",
 }
+IMPORTANT_SERVICE_NAMES = (
+    "ollama",
+    "vllm",
+    "open-webui",
+    "nautobot",
+    "grafana",
+    "prometheus",
+    "postgres",
+    "redis",
+)
 
 
 class InventoryError(RuntimeError):
@@ -599,6 +609,242 @@ def get_package_summary(system: str) -> dict[str, Any]:
     return summary
 
 
+def list_value(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, list | tuple | set):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)]
+
+
+def parse_docker_json_lines(output: str | None) -> list[dict[str, Any]]:
+    if not output:
+        return []
+    items: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            items.append(item)
+    return items
+
+
+def parse_docker_compose_ls(output: str | None) -> list[dict[str, Any]]:
+    if not output:
+        return []
+    try:
+        loaded = json.loads(output)
+    except json.JSONDecodeError:
+        return parse_docker_json_lines(output)
+    if isinstance(loaded, list):
+        return [item for item in loaded if isinstance(item, dict)]
+    if isinstance(loaded, dict):
+        return [loaded]
+    return []
+
+
+def parse_docker_labels(raw_labels: Any) -> dict[str, str]:
+    if isinstance(raw_labels, dict):
+        return {str(key): str(value) for key, value in raw_labels.items() if value not in (None, "")}
+    if not isinstance(raw_labels, str) or not raw_labels.strip():
+        return {}
+    labels: dict[str, str] = {}
+    for item in raw_labels.split(","):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key:
+            labels[key] = value.strip()
+    return labels
+
+
+def docker_json_field(item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in item and item[key] not in (None, ""):
+            return item[key]
+    return None
+
+
+def normalize_docker_ports(raw_ports: Any) -> list[str]:
+    if raw_ports in (None, ""):
+        return []
+    if isinstance(raw_ports, list):
+        return sorted({str(port) for port in raw_ports if port not in (None, "")})
+    text = str(raw_ports)
+    ports: set[str] = set()
+    for match in re.finditer(r"(?:(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|::):)?(\d+)->(\d+)/(tcp|udp)", text):
+        ports.add(f"{match.group(1)}->{match.group(2)}/{match.group(3)}")
+    if not ports:
+        for match in re.finditer(r"\b(\d+)/(tcp|udp)\b", text):
+            ports.add(f"{match.group(1)}/{match.group(2)}")
+    return sorted(ports)
+
+
+def important_service_name(container: dict[str, Any]) -> str | None:
+    labels = container.get("labels") if isinstance(container.get("labels"), dict) else {}
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (
+            container.get("name"),
+            container.get("image"),
+            labels.get("com.docker.compose.service"),
+            labels.get("com.docker.compose.project"),
+        )
+    )
+    for service_name in IMPORTANT_SERVICE_NAMES:
+        if service_name in haystack:
+            return service_name
+    return None
+
+
+def get_docker_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    installed = shutil.which("docker") is not None
+    summary: dict[str, Any] = {
+        "installed": installed,
+        "engine_state": "not_installed" if not installed else "unknown",
+        "container_running_count": None,
+        "container_total_count": None,
+        "compose_projects": [],
+        "published_ports": [],
+        "important_services": [],
+        "updated_at": collected_at,
+    }
+    if not installed:
+        return summary
+
+    version_output = run_command(["docker", "version", "--format", "json"], timeout=5)
+    if version_output:
+        summary["engine_state"] = "available"
+        try:
+            version_data = json.loads(version_output)
+        except json.JSONDecodeError:
+            version_data = {}
+        if isinstance(version_data, dict):
+            server = version_data.get("Server") if isinstance(version_data.get("Server"), dict) else {}
+            summary["server_version"] = server.get("Version") or version_data.get("ServerVersion")
+    else:
+        summary["engine_state"] = "unavailable"
+        return summary
+
+    containers: list[dict[str, Any]] = []
+    ps_output = run_command(["docker", "ps", "-a", "--format", "{{json .}}"], timeout=8)
+    for item in parse_docker_json_lines(ps_output):
+        labels = parse_docker_labels(docker_json_field(item, "Labels", "labels"))
+        name = docker_json_field(item, "Names", "Name", "names")
+        image = docker_json_field(item, "Image", "Repository", "image")
+        state = docker_json_field(item, "State", "Status", "state")
+        ports = normalize_docker_ports(docker_json_field(item, "Ports", "ports"))
+        container = {
+            "id": docker_json_field(item, "ID", "ContainerID", "id"),
+            "name": name,
+            "image": image,
+            "state": state,
+            "status": docker_json_field(item, "Status", "status"),
+            "ports": ports,
+            "compose_project": labels.get("com.docker.compose.project"),
+            "compose_service": labels.get("com.docker.compose.service"),
+            "created_at": docker_json_field(item, "CreatedAt", "Created", "created_at"),
+            "labels": {
+                key: value
+                for key, value in labels.items()
+                if key in {"com.docker.compose.project", "com.docker.compose.service"}
+            },
+        }
+        containers.append({key: value for key, value in container.items() if value not in (None, "", [], {})})
+
+    compose_projects: set[str] = {
+        str(container["compose_project"]) for container in containers if container.get("compose_project")
+    }
+    compose_output = run_command(["docker", "compose", "ls", "--format", "json"], timeout=8)
+    for project in parse_docker_compose_ls(compose_output):
+        name = docker_json_field(project, "Name", "name")
+        if name:
+            compose_projects.add(str(name))
+
+    important_services = []
+    for container in containers:
+        detected_name = important_service_name(container)
+        if not detected_name:
+            continue
+        important_services.append(
+            {
+                "service": detected_name,
+                "name": container.get("name"),
+                "image": container.get("image"),
+                "state": container.get("state"),
+                "ports": container.get("ports", []),
+                "compose_project": container.get("compose_project"),
+                "compose_service": container.get("compose_service"),
+            }
+        )
+
+    published_ports = sorted({port for container in containers for port in container.get("ports", [])})
+    running_count = sum(1 for container in containers if str(container.get("state", "")).lower() == "running")
+
+    summary.update(
+        {
+            "container_running_count": running_count,
+            "container_total_count": len(containers),
+            "compose_projects": sorted(compose_projects),
+            "published_ports": published_ports,
+            "important_services": important_services,
+            "containers": containers,
+        }
+    )
+
+    if config.get("include_all_docker_containers") is False:
+        summary.pop("containers", None)
+    return summary
+
+
+def get_service_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    service_roles = list_value(config.get("service_roles"))
+    preferred_services = config.get("preferred_services") if isinstance(config.get("preferred_services"), dict) else {}
+    docker = get_docker_summary(config, collected_at)
+    return {
+        "service_roles": service_roles,
+        "preferred_services": preferred_services,
+        "docker": docker,
+    }
+
+
+def make_docker_service_summary(services: dict[str, Any]) -> str | None:
+    docker = services.get("docker") if isinstance(services.get("docker"), dict) else {}
+    if not docker:
+        return None
+    important = docker.get("important_services") if isinstance(docker.get("important_services"), list) else []
+    service_bits = []
+    for item in important:
+        if not isinstance(item, dict):
+            continue
+        name = first_nonempty(item.get("service"), item.get("name"))
+        state = item.get("state")
+        ports = ",".join(item.get("ports") or [])
+        bit = str(name)
+        if state:
+            bit = f"{bit}:{state}"
+        if ports:
+            bit = f"{bit}@{ports}"
+        service_bits.append(bit)
+
+    fields = {
+        "engine": docker.get("engine_state"),
+        "containers": f"{docker.get('container_running_count')}/{docker.get('container_total_count')}"
+        if docker.get("container_running_count") is not None and docker.get("container_total_count") is not None
+        else None,
+        "compose": ",".join(docker.get("compose_projects") or []),
+        "ports": ",".join(docker.get("published_ports") or []),
+        "important": ",".join(service_bits),
+    }
+    return "; ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
+
+
 def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
     system = platform.system()
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
@@ -624,6 +870,7 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
     primary_interface = choose_primary_interface(interfaces, primary_ip)
     disk_summary = get_disk_summary()
     gpu_summary = get_gpu_summary(system)
+    service_summary = get_service_summary(config, now)
 
     cpu_physical = psutil.cpu_count(logical=False) if psutil is not None else None
     cpu_logical = psutil.cpu_count(logical=True) if psutil is not None else os.cpu_count()
@@ -663,6 +910,11 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         "primary_ip_address": primary_ip,
         "primary_mac_address": primary_interface.get("mac_address") if primary_interface else None,
         "software": get_package_summary(system),
+        "services": service_summary,
+        "service_roles": service_summary.get("service_roles"),
+        "preferred_services": service_summary.get("preferred_services"),
+        "docker": service_summary.get("docker"),
+        "docker_service_summary": make_docker_service_summary(service_summary),
         "self_reported": {
             "owner": config.get("owner"),
             "purpose": config.get("purpose"),
@@ -812,6 +1064,16 @@ def get_role_name(config: dict[str, Any], inventory: dict[str, Any]) -> str:
 
 
 def make_ai_resource_summary(config: dict[str, Any], inventory: dict[str, Any]) -> str:
+    preferred_services = (
+        inventory.get("preferred_services") if isinstance(inventory.get("preferred_services"), dict) else {}
+    )
+    preferred_bits = []
+    for service_name, service_data in sorted(preferred_services.items()):
+        if not isinstance(service_data, dict):
+            continue
+        endpoint = service_data.get("endpoint")
+        preferred_bits.append(f"{service_name}:{endpoint}" if endpoint else str(service_name))
+
     fields = {
         "host": config.get("device_name") or inventory.get("hostname"),
         "os": f"{inventory.get('os_name')} {inventory.get('os_version')}".strip(),
@@ -825,6 +1087,9 @@ def make_ai_resource_summary(config: dict[str, Any], inventory: dict[str, Any]) 
         "location": config.get("location"),
         "purpose": config.get("purpose"),
         "ip": inventory.get("primary_ip_address"),
+        "services": ",".join(list_value(inventory.get("service_roles"))),
+        "preferred": ",".join(preferred_bits),
+        "docker": inventory.get("docker_service_summary"),
     }
     return "; ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
 
@@ -838,7 +1103,9 @@ def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dic
         "disk": inventory.get("disk"),
         "primary_interface": inventory.get("primary_interface"),
         "software": inventory.get("software"),
+        "services": inventory.get("services"),
     }
+    docker = inventory.get("docker") if isinstance(inventory.get("docker"), dict) else {}
     fields = {
         "owner": config.get("owner"),
         "purpose": config.get("purpose"),
@@ -861,6 +1128,15 @@ def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dic
         "inventory_source": inventory.get("inventory_source"),
         "ai_resource_summary": make_ai_resource_summary(config, inventory),
         "agent_task_state": config.get("agent_task_state"),
+        "service_roles": ", ".join(list_value(inventory.get("service_roles"))),
+        "preferred_services": inventory.get("preferred_services"),
+        "docker_engine_state": docker.get("engine_state"),
+        "docker_container_running_count": docker.get("container_running_count"),
+        "docker_container_total_count": docker.get("container_total_count"),
+        "docker_compose_projects": ", ".join(docker.get("compose_projects") or []),
+        "docker_published_ports": ", ".join(docker.get("published_ports") or []),
+        "docker_service_summary": inventory.get("docker_service_summary"),
+        "service_inventory_updated_at": docker.get("updated_at"),
         "inventory_raw_json": raw,
     }
     extra = config.get("custom_fields")

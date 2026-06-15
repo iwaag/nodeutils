@@ -22,10 +22,31 @@
 # owner: "eiji"
 # purpose: "desktop"
 # description: "Self-registered workstation"
+# agent_task_state: "idle"
+
+# Stable service placement declarations for automation agents. These describe
+# intended service roles and preferred endpoints; live capacity should be
+# checked through monitoring before dispatching work.
+# service_roles:
+#   - ai-inference
+#
+# preferred_services:
+#   ollama:
+#     service_role: ai-inference
+#     preferred: true
+#     endpoint: "http://pc1:11434"
+#     startup_policy: use_existing_first
+#     fallback_policy: start_new_if_capacity_available
+#     managed_by: systemd
 
 # tags:
 #   - self-registered
 #   - home
+
+# Set to false if you want the Docker raw inventory to omit the full sanitized
+# container list and keep only counts, ports, compose projects, and important
+# scheduler-facing services.
+# include_all_docker_containers: true
 
 # These are merged into the Nautobot Device custom_fields payload.
 # custom_fields:
