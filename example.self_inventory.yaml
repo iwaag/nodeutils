@@ -38,6 +38,17 @@
 #     startup_policy: use_existing_first
 #     fallback_policy: start_new_if_capacity_available
 #     managed_by: systemd
+#
+# Optional host-local service detection hints. These help normalize observed
+# services reported by this host; they are not the cluster-wide desired service
+# catalog. Keep desired services in nauto/seed/desired_services.yaml.
+# service_probe_hints:
+#   ollama:
+#     endpoint: "http://pc1:11434"
+#     healthcheck_path: /api/tags
+#   hatchet:
+#     endpoint: "http://pc1:8080"
+#     systemd_unit: hatchet.service
 
 # tags:
 #   - self-registered

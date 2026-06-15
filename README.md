@@ -8,9 +8,9 @@ This repository contains scripts that run on individual hosts.
 
 The Nautobot-side Job and seed data live in the separate `nauto` repository. Run that Job first so the required Nautobot objects exist before hosts self-register.
 
-Collected inventory includes OS, CPU, memory, disk, network, best-effort GPU accelerator details, and a lightweight Docker/service placement snapshot. NVIDIA GPUs are read with `nvidia-smi` when available; Linux falls back to `lspci` for generic display/accelerator detection, and macOS uses `system_profiler SPDisplaysDataType`. Missing GPU or Docker tools do not fail registration.
+Collected inventory includes OS, CPU, memory, disk, network, best-effort GPU accelerator details, and a lightweight Docker/systemd service snapshot. NVIDIA GPUs are read with `nvidia-smi` when available; Linux falls back to `lspci` for generic display/accelerator detection, and macOS uses `system_profiler SPDisplaysDataType`. Missing GPU, Docker, or systemd tools do not fail registration.
 
-Docker collection is intentionally limited to scheduler-facing facts such as engine availability, container counts, compose projects, published ports, and important service containers like `ollama`, `vllm`, `open-webui`, `nautobot`, `grafana`, `prometheus`, `postgres`, and `redis`. The script does not collect container environment variables, logs, secret contents, or bind-mounted file contents.
+Docker collection is intentionally limited to scheduler-facing facts such as engine availability, container counts, compose projects, published ports, and important service containers like `ollama`, `vllm`, `open-webui`, `hatchet`, `nautobot`, `grafana`, `prometheus`, `postgres`, and `redis`. The script does not collect container environment variables, logs, secret contents, or bind-mounted file contents.
 
 ## Supported Hosts
 
@@ -69,7 +69,7 @@ cp example.self_inventory.yaml self_inventory.yaml
 editor self_inventory.yaml
 ```
 
-Use `service_roles` and `preferred_services` in `self_inventory.yaml` for stable service placement declarations. For example, a host that should normally serve local Ollama requests can declare:
+Use `service_roles` and `preferred_services` in `self_inventory.yaml` for host-local service placement preferences. For example, a host that should normally serve local Ollama requests can declare:
 
 ```yaml
 service_roles:
@@ -85,7 +85,23 @@ preferred_services:
     managed_by: systemd
 ```
 
-These fields describe intended placement and preferred endpoints. Live capacity, such as GPU utilization or VRAM pressure, should be checked through monitoring before dispatching work.
+These fields describe host-local intended placement and preferred endpoints. Live capacity, such as GPU utilization or VRAM pressure, should be checked through monitoring before dispatching work.
+
+Cluster-level desired services, such as "ollama should exist somewhere", belong in the Nautobot-side `nauto/seed/desired_services.yaml` file. They should not be copied into every host config.
+
+Use `service_probe_hints` only when local discovery needs help normalizing observed services:
+
+```yaml
+service_probe_hints:
+  ollama:
+    endpoint: "http://pc1:11434"
+    healthcheck_path: /api/tags
+  hatchet:
+    endpoint: "http://pc1:8080"
+    systemd_unit: hatchet.service
+```
+
+Self-registration promotes normalized observations to the `observed_services` Device custom field.
 
 Provide `NAUTOBOT_URL` and `NAUTOBOT_TOKEN` via `.env` or shell environment variables. When using `.env`, load it with `uv run --env-file .env ...`. Do not store API tokens directly in `self_inventory.yaml`.
 

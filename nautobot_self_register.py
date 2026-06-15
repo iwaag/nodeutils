@@ -52,6 +52,7 @@ IMPORTANT_SERVICE_NAMES = (
     "ollama",
     "vllm",
     "open-webui",
+    "hatchet",
     "nautobot",
     "grafana",
     "prometheus",
@@ -703,6 +704,44 @@ def important_service_name(container: dict[str, Any]) -> str | None:
     return None
 
 
+def service_probe_hints(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    hints = config.get("service_probe_hints")
+    if not isinstance(hints, dict):
+        return {}
+    return {
+        str(name): value
+        for name, value in hints.items()
+        if name not in (None, "") and isinstance(value, dict)
+    }
+
+
+def endpoint_from_hint_or_port(
+    service_name: str,
+    config: dict[str, Any],
+    ports: list[str] | None,
+    primary_ip: str | None,
+) -> str | None:
+    hints = service_probe_hints(config)
+    hint = hints.get(service_name, {})
+    endpoint = hint.get("endpoint")
+    if endpoint:
+        return str(endpoint)
+
+    preferred_services = config.get("preferred_services")
+    if isinstance(preferred_services, dict):
+        preferred = preferred_services.get(service_name)
+        if isinstance(preferred, dict) and preferred.get("endpoint"):
+            return str(preferred["endpoint"])
+
+    if not primary_ip:
+        return None
+    for port in ports or []:
+        match = re.match(r"(\d+)->\d+/(tcp|udp)$", str(port))
+        if match and match.group(2) == "tcp":
+            return f"http://{primary_ip}:{match.group(1)}"
+    return None
+
+
 def get_docker_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
     installed = shutil.which("docker") is not None
     summary: dict[str, Any] = {
@@ -803,14 +842,143 @@ def get_docker_summary(config: dict[str, Any], collected_at: str) -> dict[str, A
     return summary
 
 
-def get_service_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+def parse_systemd_units(output: str | None) -> list[dict[str, Any]]:
+    if not output:
+        return []
+    units = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 4)
+        if len(parts) < 4:
+            continue
+        units.append(
+            {
+                "unit": parts[0],
+                "load": parts[1],
+                "active": parts[2],
+                "sub": parts[3],
+                "description": parts[4] if len(parts) > 4 else None,
+            }
+        )
+    return units
+
+
+def important_service_name_from_systemd(unit: dict[str, Any], config: dict[str, Any]) -> str | None:
+    haystack = f"{unit.get('unit', '')} {unit.get('description', '')}".lower()
+    for service_name in sorted(set(IMPORTANT_SERVICE_NAMES) | set(service_probe_hints(config))):
+        if service_name.lower() in haystack:
+            return service_name
+        hint = service_probe_hints(config).get(service_name, {})
+        systemd_unit = hint.get("systemd_unit")
+        if systemd_unit and str(systemd_unit).lower() == str(unit.get("unit", "")).lower():
+            return service_name
+    return None
+
+
+def get_systemd_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "available": False,
+        "important_services": [],
+        "updated_at": collected_at,
+    }
+    if platform.system() != "Linux" or shutil.which("systemctl") is None:
+        return summary
+
+    output = run_command(
+        ["systemctl", "list-units", "--type=service", "--state=running", "--no-legend", "--no-pager"],
+        timeout=5,
+    )
+    if output is None:
+        return summary
+
+    summary["available"] = True
+    important_services = []
+    for unit in parse_systemd_units(output):
+        service_name = important_service_name_from_systemd(unit, config)
+        if not service_name:
+            continue
+        important_services.append(
+            {
+                "service": service_name,
+                "unit": unit.get("unit"),
+                "state": "active" if unit.get("active") == "active" else unit.get("active"),
+                "sub_state": unit.get("sub"),
+                "description": unit.get("description"),
+            }
+        )
+    summary["important_services"] = important_services
+    return summary
+
+
+def normalize_observed_services(
+    config: dict[str, Any],
+    docker: dict[str, Any],
+    systemd: dict[str, Any],
+    collected_at: str,
+    primary_ip: str | None,
+) -> dict[str, Any]:
+    observed: dict[str, Any] = {}
+
+    for item in docker.get("important_services", []) if isinstance(docker.get("important_services"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        service_name = item.get("service")
+        if not service_name:
+            continue
+        name = str(service_name)
+        ports = item.get("ports") if isinstance(item.get("ports"), list) else []
+        observed[name] = {
+            "state": item.get("state"),
+            "source": "docker",
+            "endpoint": endpoint_from_hint_or_port(name, config, ports, primary_ip),
+            "ports": ports,
+            "container_name": item.get("name"),
+            "image": item.get("image"),
+            "compose_project": item.get("compose_project"),
+            "compose_service": item.get("compose_service"),
+            "checked_at": collected_at,
+        }
+
+    for item in systemd.get("important_services", []) if isinstance(systemd.get("important_services"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        service_name = item.get("service")
+        if not service_name:
+            continue
+        name = str(service_name)
+        existing = observed.get(name, {})
+        if existing and str(existing.get("state", "")).lower() == "running":
+            continue
+        observed[name] = {
+            **existing,
+            "state": item.get("state"),
+            "source": "systemd",
+            "endpoint": endpoint_from_hint_or_port(name, config, [], primary_ip),
+            "unit": item.get("unit"),
+            "sub_state": item.get("sub_state"),
+            "checked_at": collected_at,
+        }
+
+    return {
+        service_name: {key: value for key, value in data.items() if value not in (None, "", [], {})}
+        for service_name, data in sorted(observed.items())
+    }
+
+
+def get_service_summary(config: dict[str, Any], collected_at: str, primary_ip: str | None) -> dict[str, Any]:
     service_roles = list_value(config.get("service_roles"))
     preferred_services = config.get("preferred_services") if isinstance(config.get("preferred_services"), dict) else {}
     docker = get_docker_summary(config, collected_at)
+    systemd = get_systemd_summary(config, collected_at)
+    observed_services = normalize_observed_services(config, docker, systemd, collected_at, primary_ip)
     return {
         "service_roles": service_roles,
         "preferred_services": preferred_services,
         "docker": docker,
+        "systemd": systemd,
+        "observed_services": observed_services,
     }
 
 
@@ -870,7 +1038,7 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
     primary_interface = choose_primary_interface(interfaces, primary_ip)
     disk_summary = get_disk_summary()
     gpu_summary = get_gpu_summary(system)
-    service_summary = get_service_summary(config, now)
+    service_summary = get_service_summary(config, now, primary_ip)
 
     cpu_physical = psutil.cpu_count(logical=False) if psutil is not None else None
     cpu_logical = psutil.cpu_count(logical=True) if psutil is not None else os.cpu_count()
@@ -914,6 +1082,8 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         "service_roles": service_summary.get("service_roles"),
         "preferred_services": service_summary.get("preferred_services"),
         "docker": service_summary.get("docker"),
+        "systemd": service_summary.get("systemd"),
+        "observed_services": service_summary.get("observed_services"),
         "docker_service_summary": make_docker_service_summary(service_summary),
         "self_reported": {
             "owner": config.get("owner"),
@@ -1089,6 +1259,9 @@ def make_ai_resource_summary(config: dict[str, Any], inventory: dict[str, Any]) 
         "ip": inventory.get("primary_ip_address"),
         "services": ",".join(list_value(inventory.get("service_roles"))),
         "preferred": ",".join(preferred_bits),
+        "observed": ",".join(sorted((inventory.get("observed_services") or {}).keys()))
+        if isinstance(inventory.get("observed_services"), dict)
+        else None,
         "docker": inventory.get("docker_service_summary"),
     }
     return "; ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
@@ -1130,6 +1303,7 @@ def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dic
         "agent_task_state": config.get("agent_task_state"),
         "service_roles": ", ".join(list_value(inventory.get("service_roles"))),
         "preferred_services": inventory.get("preferred_services"),
+        "observed_services": inventory.get("observed_services"),
         "docker_engine_state": docker.get("engine_state"),
         "docker_container_running_count": docker.get("container_running_count"),
         "docker_container_total_count": docker.get("container_total_count"),
