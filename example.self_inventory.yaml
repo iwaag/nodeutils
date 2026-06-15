@@ -1,0 +1,32 @@
+# Optional overrides. Without this file, nautobot-self-register uses:
+# - NAUTOBOT_URL from the environment
+# - NAUTOBOT_TOKEN from the environment
+# - location: Home
+# - status: Active
+# - role: linux-workstation on Linux, macos-workstation on macOS
+# - tags: self-registered, home
+#
+# nautobot_url: "http://nautobot.example.local"
+# token_env: "NAUTOBOT_TOKEN"
+# api_version: ""
+
+# role: "linux-workstation"
+# status: "Active"
+# location: "Home"
+
+# If omitted, the script infers these from the host.
+# device_name: "my-hostname"
+# manufacturer: "Apple"
+# device_type: "Mac"
+
+# owner: "eiji"
+# purpose: "desktop"
+# description: "Self-registered workstation"
+
+# tags:
+#   - self-registered
+#   - home
+
+# These are merged into the Nautobot Device custom_fields payload.
+# custom_fields:
+#   room: "living"

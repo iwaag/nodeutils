@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nodeutils"
+version = "0.1.0"
+description = "Host-side utility scripts for registering nodes and collecting local inventory."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "Eiji" },
+]
+keywords = ["nautobot", "inventory", "self-registration", "nodeutils"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "psutil>=5.9",
+  "PyYAML>=6.0",
+]
+
+[dependency-groups]
+dev = [
+  "build>=1.2",
+  "ruff>=0.5",
+]
+
+[tool.uv]
+package = true
+
+[project.scripts]
+nautobot-self-register = "nautobot_self_register:main"
+
+[tool.setuptools]
+py-modules = ["nautobot_self_register"]
+
+[tool.setuptools.data-files]
+"share/nodeutils" = [
+  ".env.example",
+  "example.self_inventory.yaml",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
