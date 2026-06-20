@@ -34,6 +34,8 @@ try:
 except ImportError:  # pragma: no cover - depends on host environment
     yaml = None
 
+import proxmox_inventory
+from proxmox_inventory import ProxmoxInventoryError
 
 DEFAULT_TIMEOUT = 15
 SELF_SOURCE = "nautobot-self-register"
@@ -1413,13 +1415,21 @@ def find_existing_device(
     return first_api_result(client.get("/api/dcim/devices/", {"name": name}))
 
 
-def upsert_device(config: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
-    client = NautobotClient(
+def make_nautobot_client(config: dict[str, Any]) -> NautobotClient:
+    return NautobotClient(
         base_url=get_nautobot_url(config),
         token=get_token(config),
         timeout=int(config.get("timeout", DEFAULT_TIMEOUT)),
         api_version=str(config["api_version"]) if config.get("api_version") else None,
     )
+
+
+def upsert_device(
+    config: dict[str, Any],
+    inventory: dict[str, Any],
+    client: NautobotClient | None = None,
+) -> dict[str, Any]:
+    client = client or make_nautobot_client(config)
     refs = resolve_required_objects(client, config, inventory)
     payload = build_device_payload(config, inventory, refs)
     existing = find_existing_device(client, config, inventory)
@@ -1457,6 +1467,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="print collected inventory JSON")
     parser.add_argument("--verbose", action="store_true", help="print extra progress to stderr")
     parser.add_argument("--no-ipam", action="store_true", help="reserved for Phase 2; currently no-op")
+    parser.add_argument(
+        "--proxmox",
+        choices=["auto", "enabled", "disabled"],
+        default=None,
+        help="Proxmox inventory mode; defaults to config proxmox.enabled or auto",
+    )
+    parser.add_argument("--proxmox-json", action="store_true", help="print collected Proxmox inventory JSON")
     return parser.parse_args(argv)
 
 
@@ -1466,19 +1483,47 @@ def main(argv: list[str] | None = None) -> int:
         config_path = args.config or Path("self_inventory.yaml")
         config = load_config(config_path, missing_ok=args.config is None)
         inventory = collect_inventory(config)
+        proxmox_data = proxmox_inventory.collect_proxmox_inventory(config, inventory, args.proxmox)
+        if proxmox_data.get("enabled"):
+            inventory["proxmox"] = proxmox_data
+            config = proxmox_inventory.apply_proxmox_host_defaults(config, inventory, proxmox_data)
+        elif args.proxmox_json:
+            inventory["proxmox"] = proxmox_data
+        if args.proxmox_json:
+            print(json.dumps(proxmox_data, ensure_ascii=False, indent=2, sort_keys=True))
+            if not args.json and not args.dry_run:
+                return 0
         if args.json:
             print(json.dumps(inventory, ensure_ascii=False, indent=2, sort_keys=True))
             if not args.dry_run:
                 return 0
         if args.dry_run:
-            print(json.dumps(build_dry_run_payload(config, inventory), ensure_ascii=False, indent=2, sort_keys=True))
+            dry_run_payload = {
+                "device": build_dry_run_payload(config, inventory),
+                "proxmox": proxmox_inventory.build_dry_run_payload(config, proxmox_data),
+            }
+            print(json.dumps(dry_run_payload, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
-        result = upsert_device(config, inventory)
+        client = make_nautobot_client(config)
+        result = upsert_device(config, inventory, client=client)
+        proxmox_result = None
+        if proxmox_data.get("enabled"):
+            proxmox_result = proxmox_inventory.upsert_proxmox_inventory(
+                config=config,
+                client=client,
+                host_inventory=inventory,
+                host_device=result["device"],
+                proxmox_inventory=proxmox_data,
+            )
         if args.verbose:
-            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), file=sys.stderr)
+            verbose_result = {"device": result, "proxmox": proxmox_result}
+            print(json.dumps(verbose_result, ensure_ascii=False, indent=2, sort_keys=True), file=sys.stderr)
         print(f"{result['action']}: {result['device'].get('name', inventory['hostname'])}")
         return 0
     except InventoryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ProxmoxInventoryError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

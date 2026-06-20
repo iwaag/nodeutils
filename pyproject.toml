@@ -43,7 +43,7 @@ package = true
 nautobot-self-register = "nautobot_self_register:main"
 
 [tool.setuptools]
-py-modules = ["nautobot_self_register"]
+py-modules = ["nautobot_self_register", "proxmox_inventory"]
 
 [tool.setuptools.data-files]
 "share/nodeutils" = [

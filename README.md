@@ -12,6 +12,8 @@ Collected inventory includes OS, CPU, memory, disk, network, best-effort GPU acc
 
 Docker collection is intentionally limited to scheduler-facing facts such as engine availability, container counts, compose projects, published ports, and important service containers like `ollama`, `vllm`, `open-webui`, `hatchet`, `nautobot`, `grafana`, `prometheus`, `postgres`, and `redis`. The script does not collect container environment variables, logs, secret contents, or bind-mounted file contents.
 
+When running on a Proxmox VE host, the script can also collect Proxmox cluster, node, QEMU VM, and LXC container facts with `pvesh`. In the default `auto` mode, this is skipped on non-Proxmox hosts. Proxmox hosts are still registered as Nautobot Devices first; Proxmox clusters and guests are then registered into Nautobot virtualization inventory when normal write mode is used.
+
 ## Supported Hosts
 
 - Ubuntu / Linux
@@ -43,6 +45,16 @@ docker compose ls --format json
 ```
 
 The user running the script must have permission to talk to the Docker socket for Docker facts to be collected. If Docker is unavailable or permission is denied, self-registration continues with `docker_engine_state` set to an unavailable state.
+
+Proxmox detection and inventory use local Proxmox tools:
+
+```bash
+pveversion --verbose
+pvesh get /cluster/status --output-format json
+pvesh get /cluster/resources --output-format json
+```
+
+When Proxmox inventory writes are enabled, Nautobot must already contain the required cluster type, roles, statuses, tags, device type, and custom fields. Typical names are `Proxmox VE`, `proxmox-host`, `virtual-machine`, `lxc-container`, `Active`, `Offline`, `proxmox`, and `Proxmox Host`.
 
 ## Configuration
 
@@ -117,6 +129,18 @@ Print the planned Nautobot Device payload:
 
 ```bash
 uv run --env-file .env nautobot-self-register --dry-run
+```
+
+Print only the Proxmox inventory plan when running on a Proxmox host:
+
+```bash
+uv run --env-file .env nautobot-self-register --proxmox-json
+```
+
+Force Proxmox collection and fail if this is not a usable Proxmox host:
+
+```bash
+uv run --env-file .env nautobot-self-register --proxmox enabled --dry-run
 ```
 
 Create or update the Nautobot Device:

@@ -59,6 +59,23 @@
 # scheduler-facing services.
 # include_all_docker_containers: true
 
+# Proxmox VE inventory collection. In auto mode, Proxmox data is collected only
+# when the script is running on a Proxmox host.
+# proxmox:
+#   enabled: auto
+#   cluster_type: "Proxmox VE"
+#   cluster_status: "Active"
+#   host_role: "proxmox-host"
+#   host_device_type: "Proxmox Host"
+#   qemu_role: "virtual-machine"
+#   lxc_role: "lxc-container"
+#   guest_status_map:
+#     running: "Active"
+#     stopped: "Offline"
+#     paused: "Offline"
+#   include_guest_interfaces: true
+#   include_guest_ips: true
+
 # These are merged into the Nautobot Device custom_fields payload.
 # custom_fields:
 #   room: "living"
