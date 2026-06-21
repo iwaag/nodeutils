@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nodeutils"
 version = "0.1.0"
-description = "Host-side utility scripts for registering nodes and collecting local inventory."
+description = "Host-side utility scripts for collecting local inventory reports."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
   { name = "Eiji" },
 ]
-keywords = ["nautobot", "inventory", "self-registration", "nodeutils"]
+keywords = ["inventory", "collector", "nodeutils"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -40,14 +40,13 @@ dev = [
 package = true
 
 [project.scripts]
-nautobot-self-register = "nautobot_self_register:main"
+nodeutils = "nodeutils_collect:main"
 
 [tool.setuptools]
-py-modules = ["nautobot_self_register", "proxmox_inventory"]
+py-modules = ["nodeutils_collect", "proxmox_inventory"]
 
 [tool.setuptools.data-files]
 "share/nodeutils" = [
-  ".env.example",
   "example.self_inventory.yaml",
 ]
 

@@ -1,18 +1,23 @@
 # Node Utilities
 
-This repository contains scripts that run on individual hosts.
+Host-side utility scripts for collecting local inventory reports.
 
-## Nautobot Self Register
+`nodeutils` does not write to Nautobot and does not need a Nautobot API token.
+It collects local facts and emits a bounded, versioned report for a central
+ingestor such as the `nauto` Nautobot Job.
 
-`nautobot-self-register` collects local inventory from Ubuntu/Linux and macOS systems and creates or updates the current machine as a Nautobot Device.
+## Collection Scope
 
-The Nautobot-side Job and seed data live in the separate `nauto` repository. Run that Job first so the required Nautobot objects exist before hosts self-register.
+Collected inventory includes OS, CPU, memory, disk, network, best-effort GPU
+accelerator details, Docker summary, systemd service observations, and optional
+Proxmox VE inventory when running on a Proxmox host.
 
-Collected inventory includes OS, CPU, memory, disk, network, best-effort GPU accelerator details, and a lightweight Docker/systemd service snapshot. NVIDIA GPUs are read with `nvidia-smi` when available; Linux falls back to `lspci` for generic display/accelerator detection, and macOS uses `system_profiler SPDisplaysDataType`. Missing GPU, Docker, or systemd tools do not fail registration.
-
-Docker collection is intentionally limited to scheduler-facing facts such as engine availability, container counts, compose projects, published ports, and important service containers like `ollama`, `vllm`, `open-webui`, `hatchet`, `nautobot`, `grafana`, `prometheus`, `postgres`, and `redis`. The script does not collect container environment variables, logs, secret contents, or bind-mounted file contents.
-
-When running on a Proxmox VE host, the script can also collect Proxmox cluster, node, QEMU VM, and LXC container facts with `pvesh`. In the default `auto` mode, this is skipped on non-Proxmox hosts. Proxmox hosts are still registered as Nautobot Devices first; Proxmox clusters and guests are then registered into Nautobot virtualization inventory when normal write mode is used.
+Docker collection is intentionally limited to scheduler-facing facts such as
+engine availability, container counts, compose projects, published ports, and
+important service containers like `ollama`, `vllm`, `open-webui`, `hatchet`,
+`nautobot`, `grafana`, `prometheus`, `postgres`, and `redis`. The collector
+does not collect environment variables, container logs, secret contents, or
+bind-mounted file contents.
 
 ## Supported Hosts
 
@@ -30,21 +35,12 @@ uv sync
 
 If you install dependencies directly with `pip`, install `psutil` and `PyYAML`.
 
-GPU detection uses host commands when present. Install `pciutils` on Linux if you want the generic `lspci` fallback:
+GPU detection uses host commands when present. Install `pciutils` on Linux if
+you want the generic `lspci` fallback:
 
 ```bash
 sudo apt install pciutils
 ```
-
-Docker detection uses the local `docker` CLI when present:
-
-```bash
-docker version --format json
-docker ps -a --format '{{json .}}'
-docker compose ls --format json
-```
-
-The user running the script must have permission to talk to the Docker socket for Docker facts to be collected. If Docker is unavailable or permission is denied, self-registration continues with `docker_engine_state` set to an unavailable state.
 
 Proxmox detection and inventory use local Proxmox tools:
 
@@ -54,109 +50,78 @@ pvesh get /cluster/status --output-format json
 pvesh get /cluster/resources --output-format json
 ```
 
-When Proxmox inventory writes are enabled, Nautobot must already contain the required cluster type, roles, statuses, tags, device type, and custom fields. Typical names are `Proxmox VE`, `proxmox-host`, `virtual-machine`, `lxc-container`, `Active`, `Offline`, `proxmox`, and `Proxmox Host`.
-
 ## Configuration
 
-Create a local `.env` file for Nautobot API access:
+`self_inventory.yaml` is optional. It contains host-local hints only, such as
+owner, purpose, service probe hints, and preferred services. It must not contain
+Nautobot API credentials or authoritative Nautobot fields such as final role,
+location, status, or tags.
 
-```bash
-cp .env.example .env
-editor .env
-```
-
-`self_inventory.yaml` is optional. If no config file exists, the script registers the host with default values and locally detected inventory data.
-
-Default values:
-
-- Location: `Home`
-- Status: `Active`
-- Role: `linux-workstation` on Linux, `macos-workstation` on macOS
-- Tags: `self-registered`, `home`
-
-Create `self_inventory.yaml` only when you need local overrides:
+Create a local config only when you need hints:
 
 ```bash
 cp example.self_inventory.yaml self_inventory.yaml
 editor self_inventory.yaml
 ```
 
-Use `service_roles` and `preferred_services` in `self_inventory.yaml` for host-local service placement preferences. For example, a host that should normally serve local Ollama requests can declare:
-
-```yaml
-service_roles:
-  - ai-inference
-
-preferred_services:
-  ollama:
-    service_role: ai-inference
-    preferred: true
-    endpoint: "http://pc1:11434"
-    startup_policy: use_existing_first
-    fallback_policy: start_new_if_capacity_available
-    managed_by: systemd
-```
-
-These fields describe host-local intended placement and preferred endpoints. Live capacity, such as GPU utilization or VRAM pressure, should be checked through monitoring before dispatching work.
-
-Cluster-level desired services, such as "ollama should exist somewhere", belong in the Nautobot-side `nauto/seed/desired_services.yaml` file. They should not be copied into every host config.
-
-Use `service_probe_hints` only when local discovery needs help normalizing observed services:
-
-```yaml
-service_probe_hints:
-  ollama:
-    endpoint: "http://pc1:11434"
-    healthcheck_path: /api/tags
-  hatchet:
-    endpoint: "http://pc1:8080"
-    systemd_unit: hatchet.service
-```
-
-Self-registration promotes normalized observations to the `observed_services` Device custom field.
-
-Provide `NAUTOBOT_URL` and `NAUTOBOT_TOKEN` via `.env` or shell environment variables. When using `.env`, load it with `uv run --env-file .env ...`. Do not store API tokens directly in `self_inventory.yaml`.
+Cluster-level desired services, such as "ollama should exist somewhere", belong
+in the central `nauto/seed/desired_services.yaml` file. They should not be
+copied into every host config.
 
 ## Usage
 
-Print collected inventory:
+Print a JSON report:
 
 ```bash
-uv run --env-file .env nautobot-self-register --json
+uv run nodeutils collect --format json
 ```
 
-Print the planned Nautobot Device payload:
+Write a JSON report to disk with mode `0600`:
 
 ```bash
-uv run --env-file .env nautobot-self-register --dry-run
+uv run nodeutils collect --format json --output /var/lib/nodeutils/inventory.json
 ```
 
-Print only the Proxmox inventory plan when running on a Proxmox host:
+Print YAML:
 
 ```bash
-uv run --env-file .env nautobot-self-register --proxmox-json
+uv run nodeutils collect --format yaml
 ```
 
 Force Proxmox collection and fail if this is not a usable Proxmox host:
 
 ```bash
-uv run --env-file .env nautobot-self-register --proxmox enabled --dry-run
+uv run nodeutils collect --proxmox enabled --output /var/lib/nodeutils/inventory.json
 ```
 
-Create or update the Nautobot Device:
+The report has this top-level shape:
 
-```bash
-uv run --env-file .env nautobot-self-register --verbose
+```yaml
+schema_version: nodeutils.inventory.v1
+collector:
+  name: nodeutils
+  version: 0.1.0
+  command: collect
+identity:
+  hostname: pc1
+  fqdn: pc1.example.local
+  serial_number: "..."
+  machine_id: "..."
+collected_at: "2026-06-21T00:00:00+00:00"
+facts: {}
+self_reported: {}
 ```
 
-Existing Devices are matched by serial number first. If no serial number is available, the script falls back to the Device name, which defaults to the local hostname.
+The host report is self-reported evidence. The central ingestor is responsible
+for validating it, matching the host, applying policy, and writing to Nautobot
+with server-side credentials.
 
 ## Scheduled Run Example
 
 Ubuntu cron example:
 
 ```cron
-0 3 * * * cd /path/to/nodeutils && uv run --env-file .env nautobot-self-register
+0 3 * * * cd /path/to/nodeutils && uv run nodeutils collect --output /var/lib/nodeutils/inventory.json
 ```
 
 Use an equivalent `launchd` schedule on macOS.

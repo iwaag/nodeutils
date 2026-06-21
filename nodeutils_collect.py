@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect local host inventory and upsert this machine as a Nautobot Device."""
+"""Collect local host inventory and emit a bounded nodeutils inventory report."""
 
 from __future__ import annotations
 
@@ -17,10 +17,6 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,18 +33,18 @@ except ImportError:  # pragma: no cover - depends on host environment
 import proxmox_inventory
 from proxmox_inventory import ProxmoxInventoryError
 
-DEFAULT_TIMEOUT = 15
-SELF_SOURCE = "nautobot-self-register"
+SCHEMA_VERSION = "nodeutils.inventory.v1"
+COLLECTOR_NAME = "nodeutils"
+COLLECTOR_COMMAND = "collect"
+COLLECTOR_VERSION = "0.1.0"
+SELF_SOURCE = "nodeutils"
+MAX_STRING_LENGTH = 512
+MAX_LIST_ITEMS = 200
+MAX_DICT_ITEMS = 200
+MAX_REPORT_BYTES = 2 * 1024 * 1024
+SUSPICIOUS_KEY_PARTS = ("token", "secret", "password", "passwd", "credential", "apikey", "api_key")
 DEFAULT_CONFIG: dict[str, Any] = {
-    "token_env": "NAUTOBOT_TOKEN",
-    "api_version": "",
-    "location": "Home",
-    "status": "Active",
-    "tags": ["self-registered", "home"],
-}
-DEFAULT_ROLE_BY_SYSTEM = {
-    "Linux": "linux-workstation",
-    "Darwin": "macos-workstation",
+    "include_all_docker_containers": True,
 }
 IMPORTANT_SERVICE_NAMES = (
     "ollama",
@@ -91,6 +87,12 @@ def read_text(path: str) -> str | None:
     except (OSError, UnicodeDecodeError):
         return None
     return text or None
+
+
+def get_machine_id() -> str | None:
+    if platform.system() != "Linux":
+        return None
+    return first_nonempty(read_text("/etc/machine-id"), read_text("/var/lib/dbus/machine-id"))
 
 
 def first_nonempty(*values: Any) -> Any:
@@ -620,6 +622,35 @@ def list_value(value: Any) -> list[str]:
     return [str(value)]
 
 
+def is_suspicious_key(key: Any) -> bool:
+    lowered = str(key).lower()
+    return any(part in lowered for part in SUSPICIOUS_KEY_PARTS)
+
+
+def bounded_value(value: Any) -> Any:
+    if isinstance(value, str):
+        if len(value) > MAX_STRING_LENGTH:
+            return value[:MAX_STRING_LENGTH] + "...[truncated]"
+        return value
+    if isinstance(value, int | float | bool) or value is None:
+        return value
+    if isinstance(value, list | tuple | set):
+        return [bounded_value(item) for item in list(value)[:MAX_LIST_ITEMS]]
+    if isinstance(value, dict):
+        bounded: dict[str, Any] = {}
+        for key, item_value in list(value.items())[:MAX_DICT_ITEMS]:
+            if is_suspicious_key(key):
+                bounded[str(key)] = "[redacted]"
+            else:
+                bounded[str(key)] = bounded_value(item_value)
+        return bounded
+    return bounded_value(str(value))
+
+
+def compact_dict(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in data.items() if value not in (None, "", [], {})}
+
+
 def parse_docker_json_lines(output: str | None) -> list[dict[str, Any]]:
     if not output:
         return []
@@ -1026,12 +1057,10 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         os_name = first_nonempty(os_release.get("PRETTY_NAME"), os_release.get("NAME"), "Linux")
         os_version = first_nonempty(os_release.get("VERSION_ID"), platform.release())
         hardware = get_linux_hardware()
-        default_device_type = "Ubuntu PC"
     elif system == "Darwin":
         os_name = "macOS"
         os_version = first_nonempty(run_command(["sw_vers", "-productVersion"]), platform.mac_ver()[0])
         hardware = get_macos_hardware()
-        default_device_type = "Mac"
     else:
         raise InventoryError(f"unsupported OS: {system}")
 
@@ -1063,7 +1092,6 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         "manufacturer": hardware.get("manufacturer"),
         "model": hardware.get("model"),
         "serial_number": hardware.get("serial_number"),
-        "device_type": config.get("device_type") or default_device_type,
         "cpu_model": get_cpu_model(system),
         "cpu_physical_cores": cpu_physical,
         "cpu_logical_cores": cpu_logical,
@@ -1090,390 +1118,136 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         "self_reported": {
             "owner": config.get("owner"),
             "purpose": config.get("purpose"),
-            "location": config.get("location"),
             "description": config.get("description"),
+            "service_roles": service_summary.get("service_roles"),
+            "preferred_services": service_summary.get("preferred_services"),
         },
     }
     return inventory
 
 
-@dataclass
-class NautobotClient:
-    base_url: str
-    token: str
-    timeout: int = DEFAULT_TIMEOUT
-    verify_tls: bool = True
-    api_version: str | None = None
 
-    def __post_init__(self) -> None:
-        self.base_url = self.base_url.rstrip("/")
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None = None,
-        query: dict[str, Any] | None = None,
-    ) -> Any:
-        url = f"{self.base_url}{path}"
-        if query:
-            url = f"{url}?{urllib.parse.urlencode(query, doseq=True)}"
-        data = None
-        accept = "application/json"
-        if self.api_version:
-            accept = f"{accept}; version={self.api_version}"
-        headers = {
-            "Accept": accept,
-            "Authorization": f"Token {self.token}",
-        }
-        if payload is not None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-
-        request = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise InventoryError(f"Nautobot API {method} {path} failed: HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise InventoryError(f"Nautobot API {method} {path} failed: {exc}") from exc
-
-        if not body:
-            return None
-        return json.loads(body)
-
-    def get(self, path: str, query: dict[str, Any] | None = None) -> Any:
-        return self.request("GET", path, query=query)
-
-    def post(self, path: str, payload: dict[str, Any]) -> Any:
-        return self.request("POST", path, payload=payload)
-
-    def patch(self, path: str, payload: dict[str, Any]) -> Any:
-        return self.request("PATCH", path, payload=payload)
-
-
-def api_results(response: Any) -> list[dict[str, Any]]:
-    if isinstance(response, dict) and isinstance(response.get("results"), list):
-        return response["results"]
-    if isinstance(response, list):
-        return response
-    return []
-
-
-def first_api_result(response: Any) -> dict[str, Any] | None:
-    results = api_results(response)
-    return results[0] if results else None
-
-
-def lookup_by_name(client: NautobotClient, path: str, name: str) -> dict[str, Any] | None:
-    response = client.get(path, {"name": name})
-    return first_api_result(response)
-
-
-def lookup_by_name_or_slug(client: NautobotClient, path: str, value: str) -> dict[str, Any] | None:
-    for query_key in ("name", "slug"):
-        response = client.get(path, {query_key: value})
-        found = first_api_result(response)
-        if found:
-            return found
-    return None
-
-
-def lookup_status(client: NautobotClient, name: str) -> dict[str, Any] | None:
-    for query_key in ("name", "label"):
-        found = first_api_result(client.get("/api/extras/statuses/", {query_key: name}))
-        if found:
-            return found
-    return None
-
-
-def lookup_role(client: NautobotClient, name: str) -> dict[str, Any] | None:
-    return lookup_by_name(client, "/api/extras/roles/", name)
-
-
-def lookup_device_type(client: NautobotClient, value: str) -> dict[str, Any] | None:
-    for query_key in ("model", "slug"):
-        found = first_api_result(client.get("/api/dcim/device-types/", {query_key: value}))
-        if found:
-            return found
-    return None
-
-
-def get_token(config: dict[str, Any]) -> str:
-    token_env = config.get("token_env", "NAUTOBOT_TOKEN")
-    token = os.environ.get(str(token_env)) if token_env else None
-    token = token or config.get("token")
-    if not token:
-        raise InventoryError(f"Nautobot token is required; set {token_env} or config token")
-    return str(token)
-
-
-def get_nautobot_url(config: dict[str, Any]) -> str:
-    url = os.environ.get("NAUTOBOT_URL") or config.get("nautobot_url")
-    if not url:
-        raise InventoryError("Nautobot URL is required; set NAUTOBOT_URL or config nautobot_url")
-    return str(url)
-
-
-def require_config(config: dict[str, Any], key: str) -> str:
-    value = config.get(key)
-    if not value:
-        raise InventoryError(f"config value is required: {key}")
-    return str(value)
-
-
-def get_role_name(config: dict[str, Any], inventory: dict[str, Any]) -> str:
-    role = config.get("role")
-    if role:
-        return str(role)
-    system = str(inventory.get("system") or "")
-    default_role = DEFAULT_ROLE_BY_SYSTEM.get(system)
-    if not default_role:
-        raise InventoryError(f"no default role is defined for OS: {system}")
-    return default_role
-
-
-def make_ai_resource_summary(config: dict[str, Any], inventory: dict[str, Any]) -> str:
-    preferred_services = (
-        inventory.get("preferred_services") if isinstance(inventory.get("preferred_services"), dict) else {}
-    )
-    preferred_bits = []
-    for service_name, service_data in sorted(preferred_services.items()):
-        if not isinstance(service_data, dict):
-            continue
-        endpoint = service_data.get("endpoint")
-        preferred_bits.append(f"{service_name}:{endpoint}" if endpoint else str(service_name))
-
-    fields = {
-        "host": config.get("device_name") or inventory.get("hostname"),
-        "os": f"{inventory.get('os_name')} {inventory.get('os_version')}".strip(),
-        "arch": inventory.get("architecture"),
-        "cpu": inventory.get("cpu_model"),
-        "cores": inventory.get("cpu_logical_cores"),
-        "memory_gb": inventory.get("memory_gb"),
-        "gpu": inventory.get("gpu_accelerator_summary"),
-        "disk_gb": inventory.get("disk_total_gb"),
-        "role": get_role_name(config, inventory),
-        "location": config.get("location"),
-        "purpose": config.get("purpose"),
-        "ip": inventory.get("primary_ip_address"),
-        "services": ",".join(list_value(inventory.get("service_roles"))),
-        "preferred": ",".join(preferred_bits),
-        "observed": ",".join(sorted((inventory.get("observed_services") or {}).keys()))
-        if isinstance(inventory.get("observed_services"), dict)
-        else None,
-        "docker": inventory.get("docker_service_summary"),
-    }
-    return "; ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
-
-
-def make_custom_fields(config: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
-    raw = {
-        "hostname": inventory.get("hostname"),
-        "fqdn": inventory.get("fqdn"),
-        "hardware": inventory.get("hardware"),
-        "gpu": inventory.get("gpu"),
-        "disk": inventory.get("disk"),
-        "primary_interface": inventory.get("primary_interface"),
-        "software": inventory.get("software"),
-        "services": inventory.get("services"),
-    }
-    docker = inventory.get("docker") if isinstance(inventory.get("docker"), dict) else {}
-    fields = {
-        "owner": config.get("owner"),
-        "purpose": config.get("purpose"),
-        "last_seen": inventory.get("collected_at"),
+def build_inventory_report(config: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
+    facts = {
+        "system": inventory.get("system"),
         "os_name": inventory.get("os_name"),
         "os_version": inventory.get("os_version"),
         "kernel_version": inventory.get("kernel_version"),
         "architecture": inventory.get("architecture"),
-        "cpu_model": inventory.get("cpu_model"),
-        "cpu_cores": inventory.get("cpu_logical_cores"),
-        "memory_gb": str(inventory["memory_gb"]) if inventory.get("memory_gb") is not None else None,
-        "gpu_count": inventory.get("gpu_count"),
-        "gpu_models": inventory.get("gpu_models"),
-        "gpu_memory_gb": str(inventory["gpu_memory_gb"]) if inventory.get("gpu_memory_gb") is not None else None,
-        "gpu_accelerator_summary": inventory.get("gpu_accelerator_summary"),
-        "disk_total_gb": str(inventory["disk_total_gb"]) if inventory.get("disk_total_gb") is not None else None,
-        "serial_number": inventory.get("serial_number"),
-        "primary_mac_address": inventory.get("primary_mac_address"),
-        "primary_ip_address": inventory.get("primary_ip_address"),
-        "inventory_source": inventory.get("inventory_source"),
-        "ai_resource_summary": make_ai_resource_summary(config, inventory),
-        "agent_task_state": config.get("agent_task_state"),
-        "service_roles": ", ".join(list_value(inventory.get("service_roles"))),
-        "preferred_services": inventory.get("preferred_services"),
-        "observed_services": inventory.get("observed_services"),
-        "docker_engine_state": docker.get("engine_state"),
-        "docker_container_running_count": docker.get("container_running_count"),
-        "docker_container_total_count": docker.get("container_total_count"),
-        "docker_compose_projects": ", ".join(docker.get("compose_projects") or []),
-        "docker_published_ports": ", ".join(docker.get("published_ports") or []),
-        "docker_service_summary": inventory.get("docker_service_summary"),
-        "service_inventory_updated_at": docker.get("updated_at"),
-        "inventory_raw_json": raw,
+        "timezone": inventory.get("timezone"),
+        "uptime_seconds": inventory.get("uptime_seconds"),
+        "hardware": inventory.get("hardware"),
+        "cpu": compact_dict(
+            {
+                "model": inventory.get("cpu_model"),
+                "physical_cores": inventory.get("cpu_physical_cores"),
+                "logical_cores": inventory.get("cpu_logical_cores"),
+            }
+        ),
+        "memory": compact_dict({"total_gb": inventory.get("memory_gb")}),
+        "disk": inventory.get("disk"),
+        "network": compact_dict(
+            {
+                "interfaces": inventory.get("interfaces"),
+                "primary_interface": inventory.get("primary_interface"),
+                "primary_ip_address": inventory.get("primary_ip_address"),
+                "primary_mac_address": inventory.get("primary_mac_address"),
+            }
+        ),
+        "gpu": inventory.get("gpu"),
+        "software": inventory.get("software"),
+        "services": inventory.get("services"),
+        "proxmox": inventory.get("proxmox"),
     }
-    extra = config.get("custom_fields")
-    if isinstance(extra, dict):
-        fields.update(extra)
-    return {key: value for key, value in fields.items() if value not in (None, "")}
-
-
-def object_ref(item: dict[str, Any]) -> dict[str, Any] | int:
-    return item.get("id") or item.get("url") or item
-
-
-def resolve_required_objects(
-    client: NautobotClient,
-    config: dict[str, Any],
-    inventory: dict[str, Any],
-) -> dict[str, Any]:
-    location = lookup_by_name_or_slug(client, "/api/dcim/locations/", require_config(config, "location"))
-    role_name = get_role_name(config, inventory)
-    role = lookup_role(client, role_name)
-    status = lookup_status(client, require_config(config, "status"))
-
-    manufacturer_name = str(config.get("manufacturer") or inventory.get("manufacturer") or "Generic")
-    manufacturer = lookup_by_name(client, "/api/dcim/manufacturers/", manufacturer_name)
-    if not manufacturer and manufacturer_name != "Generic":
-        manufacturer = lookup_by_name(client, "/api/dcim/manufacturers/", "Generic")
-
-    device_type_name = str(config.get("device_type") or inventory.get("device_type"))
-    device_type = lookup_device_type(client, device_type_name)
-    tags = []
-    for tag_name in config.get("tags") or []:
-        tag = lookup_by_name(client, "/api/extras/tags/", str(tag_name))
-        if not tag:
-            raise InventoryError(f"missing Nautobot tag: {tag_name}. Create it first or remove it from config.")
-        tags.append(tag)
-
-    missing = [
-        name
-        for name, value in {
-            "location": location,
-            "role": role,
-            "status": status,
-            "manufacturer": manufacturer,
-            "device_type": device_type,
-        }.items()
-        if not value
-    ]
-    if missing:
-        raise InventoryError(
-            "missing Nautobot objects: "
-            + ", ".join(missing)
-            + ". Create them in Nautobot first or adjust the config."
-        )
-    return {
-        "location": location,
-        "role": role,
-        "role_name": role_name,
-        "status": status,
-        "manufacturer": manufacturer,
-        "device_type": device_type,
-        "tags": tags,
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "collector": {
+            "name": COLLECTOR_NAME,
+            "version": COLLECTOR_VERSION,
+            "command": COLLECTOR_COMMAND,
+        },
+        "identity": compact_dict(
+            {
+                "hostname": inventory.get("hostname"),
+                "fqdn": inventory.get("fqdn"),
+                "serial_number": inventory.get("serial_number"),
+                "machine_id": get_machine_id(),
+            }
+        ),
+        "collected_at": inventory.get("collected_at"),
+        "facts": compact_dict(facts),
+        "self_reported": compact_dict(
+            {
+                "owner": config.get("owner"),
+                "purpose": config.get("purpose"),
+                "description": config.get("description"),
+                "service_roles": list_value(config.get("service_roles")),
+                "preferred_services": config.get("preferred_services")
+                if isinstance(config.get("preferred_services"), dict)
+                else {},
+            }
+        ),
     }
+    return bounded_value(report)
 
 
-def build_device_payload(
-    config: dict[str, Any],
-    inventory: dict[str, Any],
-    refs: dict[str, Any],
-) -> dict[str, Any]:
-    description = config.get("description") or f"{inventory.get('os_name')} {inventory.get('os_version')}"
-    payload: dict[str, Any] = {
-        "name": config.get("device_name") or inventory["hostname"],
-        "device_type": object_ref(refs["device_type"]),
-        "role": object_ref(refs["role"]),
-        "status": object_ref(refs["status"]),
-        "serial": inventory.get("serial_number") or "",
-        "custom_fields": make_custom_fields(config, inventory),
-        "comments": f"Managed by {SELF_SOURCE}.",
-    }
-    payload["location"] = object_ref(refs["location"])
-    if description:
-        payload["description"] = str(description)
-    if refs.get("tags"):
-        payload["tags"] = [object_ref(tag) for tag in refs["tags"]]
-    return payload
+def serialize_report(report: dict[str, Any], output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if output_format == "yaml":
+        if yaml is None:
+            raise InventoryError("YAML output requires PyYAML")
+        return yaml.safe_dump(report, sort_keys=True, allow_unicode=True)
+    raise InventoryError(f"unsupported output format: {output_format}")
 
 
-def find_existing_device(
-    client: NautobotClient,
-    config: dict[str, Any],
-    inventory: dict[str, Any],
-) -> dict[str, Any] | None:
-    serial = inventory.get("serial_number")
-    if serial:
-        found = first_api_result(client.get("/api/dcim/devices/", {"serial": serial}))
-        if found:
-            return found
-
-    name = str(config.get("device_name") or inventory["hostname"])
-    return first_api_result(client.get("/api/dcim/devices/", {"name": name}))
+def enforce_report_size(serialized: str) -> None:
+    size = len(serialized.encode("utf-8"))
+    if size > MAX_REPORT_BYTES:
+        raise InventoryError(f"report is too large: {size} bytes > {MAX_REPORT_BYTES} bytes")
 
 
-def make_nautobot_client(config: dict[str, Any]) -> NautobotClient:
-    return NautobotClient(
-        base_url=get_nautobot_url(config),
-        token=get_token(config),
-        timeout=int(config.get("timeout", DEFAULT_TIMEOUT)),
-        api_version=str(config["api_version"]) if config.get("api_version") else None,
-    )
-
-
-def upsert_device(
-    config: dict[str, Any],
-    inventory: dict[str, Any],
-    client: NautobotClient | None = None,
-) -> dict[str, Any]:
-    client = client or make_nautobot_client(config)
-    refs = resolve_required_objects(client, config, inventory)
-    payload = build_device_payload(config, inventory, refs)
-    existing = find_existing_device(client, config, inventory)
-    if existing:
-        result = client.patch(f"/api/dcim/devices/{existing['id']}/", payload)
-        return {"action": "updated", "device": result, "payload": payload}
-    result = client.post("/api/dcim/devices/", payload)
-    return {"action": "created", "device": result, "payload": payload}
-
-
-def build_dry_run_payload(config: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "name": config.get("device_name") or inventory["hostname"],
-        "location": config.get("location"),
-        "role": get_role_name(config, inventory),
-        "status": config.get("status"),
-        "manufacturer": config.get("manufacturer") or inventory.get("manufacturer") or "Generic",
-        "device_type": config.get("device_type") or inventory.get("device_type"),
-        "serial": inventory.get("serial_number") or "",
-        "description": config.get("description"),
-        "tags": config.get("tags") or [],
-        "custom_fields": make_custom_fields(config, inventory),
-    }
+def write_output(output_path: Path | None, serialized: str) -> None:
+    enforce_report_size(serialized)
+    if output_path is None:
+        print(serialized, end="")
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(output_path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(serialized)
+    os.chmod(output_path, 0o600)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    collect_parser = subparsers.add_parser("collect", help="collect local inventory and emit a report")
+    collect_parser.add_argument(
         "--config",
         type=Path,
         default=None,
         help="optional config file path; defaults to self_inventory.yaml when it exists",
     )
-    parser.add_argument("--dry-run", action="store_true", help="print intended Nautobot payload only")
-    parser.add_argument("--json", action="store_true", help="print collected inventory JSON")
-    parser.add_argument("--verbose", action="store_true", help="print extra progress to stderr")
-    parser.add_argument("--no-ipam", action="store_true", help="reserved for Phase 2; currently no-op")
-    parser.add_argument(
+    collect_parser.add_argument(
+        "--format",
+        choices=["json", "yaml"],
+        default="json",
+        help="report output format",
+    )
+    collect_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="write report to this path with mode 0600 instead of stdout",
+    )
+    collect_parser.add_argument(
         "--proxmox",
         choices=["auto", "enabled", "disabled"],
         default=None,
         help="Proxmox inventory mode; defaults to config proxmox.enabled or auto",
     )
-    parser.add_argument("--proxmox-json", action="store_true", help="print collected Proxmox inventory JSON")
     return parser.parse_args(argv)
 
 
@@ -1484,41 +1258,11 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(config_path, missing_ok=args.config is None)
         inventory = collect_inventory(config)
         proxmox_data = proxmox_inventory.collect_proxmox_inventory(config, inventory, args.proxmox)
-        if proxmox_data.get("enabled"):
+        if proxmox_data.get("enabled") or proxmox_data.get("detected"):
             inventory["proxmox"] = proxmox_data
-            config = proxmox_inventory.apply_proxmox_host_defaults(config, inventory, proxmox_data)
-        elif args.proxmox_json:
-            inventory["proxmox"] = proxmox_data
-        if args.proxmox_json:
-            print(json.dumps(proxmox_data, ensure_ascii=False, indent=2, sort_keys=True))
-            if not args.json and not args.dry_run:
-                return 0
-        if args.json:
-            print(json.dumps(inventory, ensure_ascii=False, indent=2, sort_keys=True))
-            if not args.dry_run:
-                return 0
-        if args.dry_run:
-            dry_run_payload = {
-                "device": build_dry_run_payload(config, inventory),
-                "proxmox": proxmox_inventory.build_dry_run_payload(config, proxmox_data),
-            }
-            print(json.dumps(dry_run_payload, ensure_ascii=False, indent=2, sort_keys=True))
-            return 0
-        client = make_nautobot_client(config)
-        result = upsert_device(config, inventory, client=client)
-        proxmox_result = None
-        if proxmox_data.get("enabled"):
-            proxmox_result = proxmox_inventory.upsert_proxmox_inventory(
-                config=config,
-                client=client,
-                host_inventory=inventory,
-                host_device=result["device"],
-                proxmox_inventory=proxmox_data,
-            )
-        if args.verbose:
-            verbose_result = {"device": result, "proxmox": proxmox_result}
-            print(json.dumps(verbose_result, ensure_ascii=False, indent=2, sort_keys=True), file=sys.stderr)
-        print(f"{result['action']}: {result['device'].get('name', inventory['hostname'])}")
+        report = build_inventory_report(config, inventory)
+        serialized = serialize_report(report, args.format)
+        write_output(args.output, serialized)
         return 0
     except InventoryError as exc:
         print(f"error: {exc}", file=sys.stderr)

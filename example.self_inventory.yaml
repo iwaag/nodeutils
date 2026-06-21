@@ -1,31 +1,15 @@
-# Optional overrides. Without this file, nautobot-self-register uses:
-# - NAUTOBOT_URL from the environment
-# - NAUTOBOT_TOKEN from the environment
-# - location: Home
-# - status: Active
-# - role: linux-workstation on Linux, macos-workstation on macOS
-# - tags: self-registered, home
+# Optional host-local inventory hints.
 #
-# nautobot_url: "http://nautobot.example.local"
-# token_env: "NAUTOBOT_TOKEN"
-# api_version: ""
-
-# role: "linux-workstation"
-# status: "Active"
-# location: "Home"
-
-# If omitted, the script infers these from the host.
-# device_name: "my-hostname"
-# manufacturer: "Apple"
-# device_type: "Mac"
+# This file is read by `nodeutils collect`. It must not contain Nautobot API
+# credentials or authoritative Nautobot classification such as final location,
+# role, status, or tags. Those decisions belong to the central nauto ingestor.
 
 # owner: "eiji"
 # purpose: "desktop"
-# description: "Self-registered workstation"
-# agent_task_state: "idle"
+# description: "Local AI workstation"
 
 # Stable service placement declarations for automation agents. These describe
-# intended service roles and preferred endpoints; live capacity should be
+# intended service roles and preferred endpoints. Live capacity should be
 # checked through monitoring before dispatching work.
 # service_roles:
 #   - ai-inference
@@ -38,7 +22,7 @@
 #     startup_policy: use_existing_first
 #     fallback_policy: start_new_if_capacity_available
 #     managed_by: systemd
-#
+
 # Optional host-local service detection hints. These help normalize observed
 # services reported by this host; they are not the cluster-wide desired service
 # catalog. Keep desired services in nauto/seed/desired_services.yaml.
@@ -50,10 +34,6 @@
 #     endpoint: "http://pc1:8080"
 #     systemd_unit: hatchet.service
 
-# tags:
-#   - self-registered
-#   - home
-
 # Set to false if you want the Docker raw inventory to omit the full sanitized
 # container list and keep only counts, ports, compose projects, and important
 # scheduler-facing services.
@@ -63,19 +43,5 @@
 # when the script is running on a Proxmox host.
 # proxmox:
 #   enabled: auto
-#   cluster_type: "Proxmox VE"
-#   cluster_status: "Active"
-#   host_role: "proxmox-host"
-#   host_device_type: "Proxmox Host"
-#   qemu_role: "virtual-machine"
-#   lxc_role: "lxc-container"
-#   guest_status_map:
-#     running: "Active"
-#     stopped: "Offline"
-#     paused: "Offline"
 #   include_guest_interfaces: true
 #   include_guest_ips: true
-
-# These are merged into the Nautobot Device custom_fields payload.
-# custom_fields:
-#   room: "living"

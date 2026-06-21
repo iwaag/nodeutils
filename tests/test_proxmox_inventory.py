@@ -76,11 +76,6 @@ class ProxmoxInventoryTests(unittest.TestCase):
         self.assertEqual(container["interfaces"][0]["name"], "net0")
         self.assertEqual(container["unprivileged"], 1)
 
-    def test_build_dry_run_payload_for_disabled_inventory(self) -> None:
-        payload = proxmox_inventory.build_dry_run_payload({}, {"enabled": False, "detected": False, "mode": "auto"})
-
-        self.assertEqual(payload, {"enabled": False, "detected": False, "mode": "auto"})
-
 
 if __name__ == "__main__":
     unittest.main()
