@@ -31,7 +31,7 @@ class InventoryReportTests(unittest.TestCase):
 
         with mock.patch.object(nodeutils_collect, "get_machine_id", return_value="machine-1"):
             report = nodeutils_collect.build_inventory_report(
-                {"owner": "eiji", "purpose": "local-ai", "service_roles": ["ai-inference"]},
+                {"owner": "eiji", "purpose": "local-ai"},
                 inventory,
             )
 
@@ -40,7 +40,8 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(report["identity"]["hostname"], "pc1")
         self.assertEqual(report["identity"]["machine_id"], "machine-1")
         self.assertEqual(report["facts"]["cpu"]["logical_cores"], 8)
-        self.assertEqual(report["self_reported"]["service_roles"], ["ai-inference"])
+        self.assertNotIn("service_roles", report["self_reported"])
+        self.assertNotIn("preferred_services", report["self_reported"])
         self.assertNotIn("role", report["self_reported"])
         self.assertNotIn("location", report["self_reported"])
 

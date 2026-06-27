@@ -760,12 +760,6 @@ def endpoint_from_hint_or_port(
     if endpoint:
         return str(endpoint)
 
-    preferred_services = config.get("preferred_services")
-    if isinstance(preferred_services, dict):
-        preferred = preferred_services.get(service_name)
-        if isinstance(preferred, dict) and preferred.get("endpoint"):
-            return str(preferred["endpoint"])
-
     if not primary_ip:
         return None
     for port in ports or []:
@@ -1001,14 +995,10 @@ def normalize_observed_services(
 
 
 def get_service_summary(config: dict[str, Any], collected_at: str, primary_ip: str | None) -> dict[str, Any]:
-    service_roles = list_value(config.get("service_roles"))
-    preferred_services = config.get("preferred_services") if isinstance(config.get("preferred_services"), dict) else {}
     docker = get_docker_summary(config, collected_at)
     systemd = get_systemd_summary(config, collected_at)
     observed_services = normalize_observed_services(config, docker, systemd, collected_at, primary_ip)
     return {
-        "service_roles": service_roles,
-        "preferred_services": preferred_services,
         "docker": docker,
         "systemd": systemd,
         "observed_services": observed_services,
@@ -1109,8 +1099,6 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         "primary_mac_address": primary_interface.get("mac_address") if primary_interface else None,
         "software": get_package_summary(system),
         "services": service_summary,
-        "service_roles": service_summary.get("service_roles"),
-        "preferred_services": service_summary.get("preferred_services"),
         "docker": service_summary.get("docker"),
         "systemd": service_summary.get("systemd"),
         "observed_services": service_summary.get("observed_services"),
@@ -1119,8 +1107,6 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
             "owner": config.get("owner"),
             "purpose": config.get("purpose"),
             "description": config.get("description"),
-            "service_roles": service_summary.get("service_roles"),
-            "preferred_services": service_summary.get("preferred_services"),
         },
     }
     return inventory
@@ -1181,10 +1167,6 @@ def build_inventory_report(config: dict[str, Any], inventory: dict[str, Any]) ->
                 "owner": config.get("owner"),
                 "purpose": config.get("purpose"),
                 "description": config.get("description"),
-                "service_roles": list_value(config.get("service_roles")),
-                "preferred_services": config.get("preferred_services")
-                if isinstance(config.get("preferred_services"), dict)
-                else {},
             }
         ),
     }

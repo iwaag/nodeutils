@@ -8,21 +8,6 @@
 # purpose: "desktop"
 # description: "Local AI workstation"
 
-# Stable service placement declarations for automation agents. These describe
-# intended service roles and preferred endpoints. Live capacity should be
-# checked through monitoring before dispatching work.
-# service_roles:
-#   - ai-inference
-#
-# preferred_services:
-#   ollama:
-#     service_role: ai-inference
-#     preferred: true
-#     endpoint: "http://pc1:11434"
-#     startup_policy: use_existing_first
-#     fallback_policy: start_new_if_capacity_available
-#     managed_by: systemd
-
 # Optional host-local service detection hints. These help normalize observed
 # services reported by this host; they are not the cluster-wide desired service
 # catalog. Keep desired services in nauto/seed/desired_services.yaml.
