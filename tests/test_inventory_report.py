@@ -58,6 +58,45 @@ class InventoryReportTests(unittest.TestCase):
             mode = stat.S_IMODE(output_path.stat().st_mode)
             self.assertEqual(mode, 0o600)
 
+    def test_docker_service_probe_hint_extends_builtin_names(self) -> None:
+        container = {
+            "name": "edge-dnsmasq-primary",
+            "image": "example/edge-dnsmasq:latest",
+            "labels": {},
+        }
+
+        self.assertIsNone(nodeutils_collect.important_service_name(container))
+        self.assertEqual(
+            nodeutils_collect.important_service_name(
+                container,
+                {"service_probe_hints": {"dnsmasq": {}}},
+            ),
+            "dnsmasq",
+        )
+
+    def test_systemd_probe_hint_supports_nomad_and_node_exporter_units(self) -> None:
+        config = {
+            "service_probe_hints": {
+                "nomad": {"systemd_unit": "nomad.service"},
+                "prometheus-node-exporter": {"systemd_unit": "prometheus-node-exporter.service"},
+            }
+        }
+
+        self.assertEqual(
+            nodeutils_collect.important_service_name_from_systemd(
+                {"unit": "nomad.service", "description": "HashiCorp agent"},
+                config,
+            ),
+            "nomad",
+        )
+        self.assertEqual(
+            nodeutils_collect.important_service_name_from_systemd(
+                {"unit": "prometheus-node-exporter.service", "description": "Metrics"},
+                config,
+            ),
+            "prometheus-node-exporter",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

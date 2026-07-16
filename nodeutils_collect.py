@@ -720,7 +720,8 @@ def normalize_docker_ports(raw_ports: Any) -> list[str]:
     return sorted(ports)
 
 
-def important_service_name(container: dict[str, Any]) -> str | None:
+def important_service_name(container: dict[str, Any], config: dict[str, Any] | None = None) -> str | None:
+    config = config or {}
     labels = container.get("labels") if isinstance(container.get("labels"), dict) else {}
     haystack = " ".join(
         str(value or "").lower()
@@ -731,7 +732,10 @@ def important_service_name(container: dict[str, Any]) -> str | None:
             labels.get("com.docker.compose.project"),
         )
     )
-    for service_name in IMPORTANT_SERVICE_NAMES:
+    for service_name in sorted(
+        set(IMPORTANT_SERVICE_NAMES) | set(service_probe_hints(config)),
+        key=lambda name: (-len(name), name),
+    ):
         if service_name in haystack:
             return service_name
     return None
@@ -835,7 +839,7 @@ def get_docker_summary(config: dict[str, Any], collected_at: str) -> dict[str, A
 
     important_services = []
     for container in containers:
-        detected_name = important_service_name(container)
+        detected_name = important_service_name(container, config)
         if not detected_name:
             continue
         important_services.append(
@@ -894,12 +898,16 @@ def parse_systemd_units(output: str | None) -> list[dict[str, Any]]:
 
 def important_service_name_from_systemd(unit: dict[str, Any], config: dict[str, Any]) -> str | None:
     haystack = f"{unit.get('unit', '')} {unit.get('description', '')}".lower()
-    for service_name in sorted(set(IMPORTANT_SERVICE_NAMES) | set(service_probe_hints(config))):
-        if service_name.lower() in haystack:
-            return service_name
-        hint = service_probe_hints(config).get(service_name, {})
+    hints = service_probe_hints(config)
+    for service_name, hint in sorted(hints.items()):
         systemd_unit = hint.get("systemd_unit")
         if systemd_unit and str(systemd_unit).lower() == str(unit.get("unit", "")).lower():
+            return service_name
+    for service_name in sorted(
+        set(IMPORTANT_SERVICE_NAMES) | set(hints),
+        key=lambda name: (-len(name), name),
+    ):
+        if service_name.lower() in haystack:
             return service_name
     return None
 
