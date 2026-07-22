@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import hashlib
+
 try:
     import psutil  # type: ignore
 except ImportError:  # pragma: no cover - depends on host environment
@@ -33,15 +35,23 @@ except ImportError:  # pragma: no cover - depends on host environment
 import proxmox_inventory
 from proxmox_inventory import ProxmoxInventoryError
 
-SCHEMA_VERSION = "nodeutils.inventory.v1"
+# fix_sshkey3 Step 4: v1 -> v2 is a coordinated breaking change (new
+# observed_services[*].managed_files structure). No dual reader -- the nauto
+# ingest policy and nctl dump parser both expect v2 only after rollout.
+SCHEMA_VERSION = "nodeutils.inventory.v2"
 COLLECTOR_NAME = "nodeutils"
 COLLECTOR_COMMAND = "collect"
-COLLECTOR_VERSION = "0.1.0"
+COLLECTOR_VERSION = "0.2.0"
 SELF_SOURCE = "nodeutils"
 MAX_STRING_LENGTH = 512
 MAX_LIST_ITEMS = 200
 MAX_DICT_ITEMS = 200
 MAX_REPORT_BYTES = 2 * 1024 * 1024
+# Bounded binary read for a managed-file digest observation (fix_sshkey3
+# Step 4). A file larger than this is reported as status "too_large" rather
+# than read into memory -- this is a metadata probe, never a general-purpose
+# file transfer or integrity-monitoring tool.
+MAX_MANAGED_FILE_BYTES = 4 * 1024 * 1024
 SUSPICIOUS_KEY_PARTS = ("token", "secret", "password", "passwd", "credential", "apikey", "api_key")
 DEFAULT_CONFIG: dict[str, Any] = {
     "include_all_docker_containers": True,
@@ -947,6 +957,66 @@ def get_systemd_summary(config: dict[str, Any], collected_at: str) -> dict[str, 
     return summary
 
 
+def observe_managed_file(path_str: str, collected_at: str) -> dict[str, Any]:
+    """Return one closed managed-file observation for `path_str`.
+
+    fix_sshkey3 Step 4: statuses are `present`, `missing`, `unreadable`, and
+    `too_large`. Reports metadata only -- the digest and size, never file
+    content -- and is the one standard full-file SHA-256 (no comment
+    stripping) `nctl_core.dnsmasq.dnsmasq_content_sha256` computes on the
+    controller side, so the two can be compared directly.
+    """
+    entry: dict[str, Any] = {"path": path_str, "checked_at": collected_at}
+    path = Path(path_str)
+    try:
+        file_stat = path.stat()
+    except FileNotFoundError:
+        entry["status"] = "missing"
+        return entry
+    except OSError:
+        entry["status"] = "unreadable"
+        return entry
+    if not path.is_file():
+        entry["status"] = "missing"
+        return entry
+    if file_stat.st_size > MAX_MANAGED_FILE_BYTES:
+        entry["status"] = "too_large"
+        entry["size"] = file_stat.st_size
+        return entry
+    try:
+        data = path.read_bytes()
+    except OSError:
+        entry["status"] = "unreadable"
+        return entry
+    entry["status"] = "present"
+    entry["sha256"] = hashlib.sha256(data).hexdigest()
+    entry["size"] = len(data)
+    return entry
+
+
+def managed_files_for_service(service_name: str, config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    """Return `{key: observe_managed_file(...)}` for one service's `managed_files` hint.
+
+    Only absolute paths from the trusted, nctl-generated probe config are
+    ever probed (fix_sshkey3 Step 4) -- a relative or otherwise malformed
+    path in `managed_files.<key>.path` is silently omitted from the result
+    rather than probed against the collector's own cwd.
+    """
+    hint = service_probe_hints(config).get(service_name, {})
+    managed_files = hint.get("managed_files")
+    if not isinstance(managed_files, dict):
+        return {}
+    results: dict[str, Any] = {}
+    for key, spec in managed_files.items():
+        if not isinstance(spec, dict):
+            continue
+        path_str = spec.get("path")
+        if not isinstance(path_str, str) or not path_str or not Path(path_str).is_absolute():
+            continue
+        results[str(key)] = observe_managed_file(path_str, collected_at)
+    return results
+
+
 def normalize_observed_services(
     config: dict[str, Any],
     docker: dict[str, Any],
@@ -995,6 +1065,20 @@ def normalize_observed_services(
             "sub_state": item.get("sub_state"),
             "checked_at": collected_at,
         }
+
+    # fix_sshkey3 Step 4: a hinted managed-file observation is attached (and
+    # the service entry created if docker/systemd never independently
+    # detected it) for every `service_probe_hints` entry that configures
+    # `managed_files` -- content convergence must be observable even for a
+    # service whose process the docker/systemd detection missed.
+    for service_name, hint in service_probe_hints(config).items():
+        if "managed_files" not in hint:
+            continue
+        managed_files = managed_files_for_service(service_name, config, collected_at)
+        if not managed_files:
+            continue
+        existing = observed.get(service_name, {"source": "probe"})
+        observed[service_name] = {**existing, "managed_files": managed_files}
 
     return {
         service_name: {key: value for key, value in data.items() if value not in (None, "", [], {})}

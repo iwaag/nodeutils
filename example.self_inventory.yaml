@@ -18,6 +18,18 @@
 #   hatchet:
 #     endpoint: "http://pc1:8080"
 #     systemd_unit: hatchet.service
+#   dnsmasq:
+#     systemd_unit: dnsmasq.service
+#     # Closed managed-file digest observation (fix_sshkey3 Step 4): the path
+#     # must be absolute (relative paths are silently rejected, never probed
+#     # against the collector's own cwd) and come from nctl-generated
+#     # deployment-profile metadata, never hand-written for a real host. Only
+#     # metadata (status/sha256/size/checked_at) is reported -- never file
+#     # content.
+#     managed_files:
+#       records:
+#         path: /etc/dnsmasq.d/nintent-records.conf
+#         digest: sha256
 
 # Set to false if you want the Docker raw inventory to omit the full sanitized
 # container list and keep only counts, ports, compose projects, and important

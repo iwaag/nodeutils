@@ -97,10 +97,10 @@ uv run nodeutils collect --proxmox enabled --output /var/lib/nodeutils/inventory
 The report has this top-level shape:
 
 ```yaml
-schema_version: nodeutils.inventory.v1
+schema_version: nodeutils.inventory.v2
 collector:
   name: nodeutils
-  version: 0.1.0
+  version: 0.2.0
   command: collect
 identity:
   hostname: pc1
@@ -115,6 +115,39 @@ self_reported: {}
 The host report is self-reported evidence. The central ingestor is responsible
 for validating it, matching the host, applying policy, and writing to Nautobot
 with server-side credentials.
+
+### Managed-file digest observation (v2)
+
+A service configured with `service_probe_hints.<name>.managed_files` in
+`self_inventory.yaml` gets a closed content observation attached to its
+`facts.services.observed_services.<name>` entry:
+
+```json
+"observed_services": {
+  "dnsmasq": {
+    "state": "active",
+    "source": "systemd",
+    "managed_files": {
+      "records": {
+        "path": "/etc/dnsmasq.d/nintent-records.conf",
+        "status": "present",
+        "sha256": "<64 lowercase hex>",
+        "size": 1234,
+        "checked_at": "2026-07-22T00:00:00+00:00"
+      }
+    }
+  }
+}
+```
+
+Statuses are `present`, `missing`, `unreadable`, and `too_large`. Only
+absolute paths are ever probed; a relative or malformed `managed_files.*.path`
+is silently dropped from the report, never resolved against the collector's
+own working directory. Reads are bounded (4 MiB) and binary -- file content
+never appears in the report, only metadata. This is a coordinated breaking
+change from `nodeutils.inventory.v1`: there is no dual v1/v2 reader anywhere
+in the pipeline, so nctl's dump parser and the nauto ingest policy must be
+updated in the same maintenance window as this collector.
 
 ## Scheduled Run Example
 
