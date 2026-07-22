@@ -149,6 +149,12 @@ change from `nodeutils.inventory.v1`: there is no dual v1/v2 reader anywhere
 in the pipeline, so nctl's dump parser and the nauto ingest policy must be
 updated in the same maintenance window as this collector.
 
+For dnsmasq this probes only the nctl-owned records/ranges file. It reports the
+actual host digest, not a controller-side "applied" acknowledgment, and it
+never serializes the file content. The checked-in `tests/fixtures/dnsmasq-v5-golden.conf`
+is shared byte-for-byte with nctl's fixture; both projects independently verify
+its SHA-256 (`c25e51c4efce07281e580dcfb1ecad73d666a70310f87cd28ad448241215e592`).
+
 ## Scheduled Run Example
 
 Ubuntu cron example:

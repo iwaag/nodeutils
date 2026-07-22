@@ -10,8 +10,20 @@ from unittest import mock
 
 import nodeutils_collect
 
+GOLDEN_DNSMASQ_SHA256 = "c25e51c4efce07281e580dcfb1ecad73d666a70310f87cd28ad448241215e592"
+
 
 class InventoryReportTests(unittest.TestCase):
+    def test_cross_repository_dnsmasq_v5_golden_digest(self) -> None:
+        """Hash the shared deterministic nctl artifact as a host would."""
+        path = Path(__file__).parent / "fixtures" / "dnsmasq-v5-golden.conf"
+
+        observed = nodeutils_collect.observe_managed_file(str(path), "2026-07-22T00:00:00+00:00")
+
+        self.assertEqual(observed["status"], "present")
+        self.assertEqual(observed["sha256"], GOLDEN_DNSMASQ_SHA256)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), GOLDEN_DNSMASQ_SHA256)
+
     def test_build_inventory_report_has_versioned_envelope(self) -> None:
         inventory = {
             "collected_at": "2026-06-21T00:00:00+00:00",
