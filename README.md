@@ -50,6 +50,22 @@ pvesh get /cluster/status --output-format json
 pvesh get /cluster/resources --output-format json
 ```
 
+`pvesh` requires root to reach Proxmox's `pmxcfs` IPC socket. When `nodeutils collect` runs as a
+non-root user (the supported `nctl`/Ansible collection path), it does not sudo into `pvesh`
+directly. Instead it requires a pre-installed, allowlisted read-only proxy:
+
+```text
+/usr/local/libexec/nodeutils-pvesh-read
+```
+
+and a matching `NOPASSWD` sudoers grant scoped to exactly that helper path (installed by the
+`nodeutils_pvesh_helper` Ansible role in `ansible_agdev`; see
+`devdocs/small/permission_fix/plan_pvesh.md` in the `pj-clusterintent` superproject). If the
+helper is missing, `nodeutils collect` fails with a specific privileged-helper error rather than
+falling back to unprivileged `pvesh` or silently skipping Proxmox collection. Running
+`nodeutils collect` as root (manual/administrative use) bypasses the helper and calls `pvesh`
+directly.
+
 ## Configuration
 
 `self_inventory.yaml` is optional. It contains host-local hints only, such as

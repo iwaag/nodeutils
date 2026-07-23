@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import shutil
@@ -12,6 +13,16 @@ from pathlib import Path
 from typing import Any
 
 PROXMOX_SOURCE = "nodeutils-proxmox"
+
+# Security-protocol constants shared with ansible_agdev's nodeutils_pvesh_helper role. Both sides
+# must assert the exact same helper path so the sudo grant and this caller cannot drift apart.
+# Confirmed root-owned on aghub in devdocs/small/permission_fix/report0.md; not configurable via
+# the host-local probe YAML.
+PVESH_BIN = "/usr/bin/pvesh"
+PVESH_HELPER_PATH = "/usr/local/libexec/nodeutils-pvesh-read"
+SUDO_BIN = "/usr/bin/sudo"
+
+_STDERR_SNIPPET_LIMIT = 200
 DEFAULT_PROXMOX_CONFIG: dict[str, Any] = {
     "enabled": "auto",
     "cluster_type": "Proxmox VE",
@@ -96,12 +107,44 @@ def is_proxmox_host() -> bool:
     return run_command(["pveversion"], timeout=5) is not None
 
 
+def _bounded_stderr(stderr: str | None) -> str:
+    text = (stderr or "").strip()
+    if len(text) > _STDERR_SNIPPET_LIMIT:
+        text = text[:_STDERR_SNIPPET_LIMIT] + "…"
+    return text
+
+
+def _pvesh_argv(path: str) -> list[str]:
+    if os.geteuid() == 0:
+        return [PVESH_BIN, "get", path, "--output-format", "json"]
+    if not (Path(PVESH_HELPER_PATH).is_file() and os.access(PVESH_HELPER_PATH, os.X_OK)):
+        raise ProxmoxInventoryError(
+            f"privileged pvesh helper unavailable at {PVESH_HELPER_PATH}; "
+            "install the nodeutils_pvesh_helper role before collecting Proxmox inventory"
+        )
+    return [SUDO_BIN, "-n", PVESH_HELPER_PATH, path]
+
+
 def run_pvesh(path: str, timeout: int = 15) -> Any:
-    output = run_command(["pvesh", "get", path, "--output-format", "json"], timeout=timeout)
-    if output is None:
-        raise ProxmoxInventoryError(f"failed to run pvesh get {path}")
+    argv = _pvesh_argv(path)
+
     try:
-        return json.loads(output)
+        completed = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ProxmoxInventoryError(f"pvesh get {path} timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise ProxmoxInventoryError(f"failed to invoke pvesh for {path}: {exc.__class__.__name__}") from exc
+
+    if completed.returncode != 0:
+        stderr = _bounded_stderr(completed.stderr)
+        if "a password is required" in stderr:
+            raise ProxmoxInventoryError(f"passwordless sudo not authorized for pvesh get {path}")
+        if stderr.startswith("nodeutils-pvesh-read:"):
+            raise ProxmoxInventoryError(f"privileged pvesh helper rejected {path}: {stderr}")
+        raise ProxmoxInventoryError(f"pvesh get {path} failed (rc={completed.returncode}): {stderr}")
+
+    try:
+        return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise ProxmoxInventoryError(f"invalid JSON from pvesh get {path}: {exc}") from exc
 
