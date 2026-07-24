@@ -147,7 +147,7 @@ class PveshHelperBoundaryIntegrationTest(unittest.TestCase):
             self.assertTrue(pvesh_log.exists(), "fake pvesh was never invoked")
             called_paths = pvesh_log.read_text(encoding="utf-8").splitlines()
             self.assertIn("get /cluster/status", called_paths)
-            self.assertIn("get /cluster/resources", called_paths)
+            self.assertIn("get /nodes", called_paths)
             self.assertIn("get /nodes", called_paths)
 
             # The report was written by this (non-root, in this test) process with mode 0600.
@@ -159,7 +159,8 @@ class PveshHelperBoundaryIntegrationTest(unittest.TestCase):
             proxmox_facts = report["facts"]["proxmox"]
             self.assertTrue(proxmox_facts["enabled"])
             self.assertTrue(proxmox_facts["detected"])
-            self.assertEqual(proxmox_facts["cluster"]["nodes"], ["aghub"])
+            self.assertEqual(proxmox_facts["cluster"]["observed_node_names"], ["aghub"])
+            self.assertEqual(proxmox_facts["schema_version"], proxmox_inventory.PROXMOX_SCHEMA_VERSION)
 
             # The report remains readable by the normal nctl retrieval path. nctl's own
             # virtualenv (pydantic, yaml) is not available inside nodeutils' venv, so this

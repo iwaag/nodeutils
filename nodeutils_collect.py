@@ -1234,8 +1234,11 @@ def build_inventory_report(config: dict[str, Any], inventory: dict[str, Any]) ->
         "gpu": inventory.get("gpu"),
         "software": inventory.get("software"),
         "services": inventory.get("services"),
-        "proxmox": inventory.get("proxmox"),
     }
+    # facts.proxmox is validated and bounded by its own nodeutils.proxmox.v1 semantic limits
+    # (see proxmox_inventory.py); it must never pass through the generic 200-item/200-key
+    # bounder below, which would silently truncate valid guest/storage collections above 200.
+    proxmox_facts = inventory.get("proxmox")
     report = {
         "schema_version": SCHEMA_VERSION,
         "collector": {
@@ -1261,7 +1264,10 @@ def build_inventory_report(config: dict[str, Any], inventory: dict[str, Any]) ->
             }
         ),
     }
-    return bounded_value(report)
+    bounded_report = bounded_value(report)
+    if proxmox_facts is not None:
+        bounded_report.setdefault("facts", {})["proxmox"] = proxmox_facts
+    return bounded_report
 
 
 def serialize_report(report: dict[str, Any], output_format: str) -> str:
