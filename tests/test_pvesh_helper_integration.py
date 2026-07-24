@@ -43,8 +43,16 @@ _FAKE_RESPONSES = {
     "/cluster/resources": [],
     "/nodes": [{"node": "aghub"}],
     "/nodes/aghub/qemu": [],
-    "/nodes/aghub/lxc": [],
-    "/nodes/aghub/storage": [],
+    "/nodes/aghub/lxc": [{"vmid": 108, "name": "agdnsmasq", "status": "running"}],
+    "/nodes/aghub/lxc/108/config": {
+        "cores": 1,
+        "rootfs": "local-lvm:vm-108-disk-0,size=8G",
+        "net0": "name=eth0,bridge=vmbr0,hwaddr=BC:24:11:23:DC:B7,ip=192.168.0.2/24,type=veth",
+    },
+    "/nodes/aghub/storage": [{"storage": "local", "content": "iso,vztmpl,backup"}],
+    "/nodes/aghub/storage/local/content": [
+        {"volid": "local:vztmpl/debian-13-standard.tar.zst", "content": "vztmpl", "format": "tzst", "size": 123}
+    ],
     "/nodes/aghub/network": [],
 }
 
@@ -148,7 +156,9 @@ class PveshHelperBoundaryIntegrationTest(unittest.TestCase):
             called_paths = pvesh_log.read_text(encoding="utf-8").splitlines()
             self.assertIn("get /cluster/status", called_paths)
             self.assertIn("get /nodes", called_paths)
-            self.assertIn("get /nodes", called_paths)
+            # Positive evidence the new storage-content path actually executed through the
+            # real helper (Step 2), not merely that some earlier path succeeded.
+            self.assertIn("get /nodes/aghub/storage/local/content", called_paths)
 
             # The report was written by this (non-root, in this test) process with mode 0600.
             mode = stat.S_IMODE(report_path.stat().st_mode)
@@ -161,6 +171,12 @@ class PveshHelperBoundaryIntegrationTest(unittest.TestCase):
             self.assertTrue(proxmox_facts["detected"])
             self.assertEqual(proxmox_facts["cluster"]["observed_node_names"], ["aghub"])
             self.assertEqual(proxmox_facts["schema_version"], proxmox_inventory.PROXMOX_SCHEMA_VERSION)
+            self.assertEqual(
+                proxmox_facts["storage_content"][0]["items"][0]["volid"],
+                "local:vztmpl/debian-13-standard.tar.zst",
+            )
+            lxc_by_vmid = {item["vmid"]: item for item in proxmox_facts["lxc_containers"]}
+            self.assertEqual(lxc_by_vmid[108]["name"], "agdnsmasq")
 
             # The report remains readable by the normal nctl retrieval path. nctl's own
             # virtualenv (pydantic, yaml) is not available inside nodeutils' venv, so this
