@@ -180,3 +180,9 @@ Ubuntu cron example:
 ```
 
 Use an equivalent `launchd` schedule on macOS.
+
+## Tests
+
+Run the ordinary suite with `uv run pytest -q --durations=20`. The repository
+[test strategy command matrix](../README_DEV.md#test-strategy-command-matrix) defines the
+privileged-helper integration gate, prerequisites, and cleanup ownership.
