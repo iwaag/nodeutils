@@ -65,7 +65,11 @@ IMPORTANT_SERVICE_NAMES = (
     "prometheus",
     "postgres",
     "redis",
+    "pj-voxel3dprint",
+    "vdbmat-openvdb-cycles",
+    "blender",
 )
+
 
 
 class InventoryError(RuntimeError):
@@ -1079,7 +1083,38 @@ def normalize_observed_services(
         existing = observed.get(service_name, {"source": "probe"})
         observed[service_name] = {**existing, "managed_files": managed_files}
 
+    # Host tools and Docker images probing for non-daemon runtimes (e.g. blender, vdbmat-openvdb-cycles)
+    for tool_name, possible_paths in [("blender", ["/snap/bin/blender", "/usr/bin/blender"])]:
+        if tool_name not in observed:
+            found_path = shutil.which(tool_name)
+            if not found_path:
+                for path_candidate in possible_paths:
+                    if os.path.exists(path_candidate):
+                        found_path = path_candidate
+                        break
+            if found_path:
+                observed[tool_name] = {
+                    "source": "host_tool",
+                    "state": "installed",
+                    "path": found_path,
+                    "checked_at": collected_at,
+                }
+
+    if docker.get("installed"):
+        images_output = run_command(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], timeout=5)
+        if images_output:
+            for line in images_output.splitlines():
+                if "vdbmat-openvdb-cycles" in line:
+                    observed["vdbmat-openvdb-cycles"] = {
+                        "source": "docker_image",
+                        "state": "present",
+                        "image": line.strip(),
+                        "checked_at": collected_at,
+                    }
+                    break
+
     return {
+
         service_name: {key: value for key, value in data.items() if value not in (None, "", [], {})}
         for service_name, data in sorted(observed.items())
     }
