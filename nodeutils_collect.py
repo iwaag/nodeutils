@@ -960,6 +960,56 @@ def get_systemd_summary(config: dict[str, Any], collected_at: str) -> dict[str, 
     return summary
 
 
+def _node_agent_version() -> str | None:
+    """Return the installed OpenCode version without exposing its configuration."""
+    executable = shutil.which("opencode") or str(Path.home() / ".local/bin/opencode")
+    return run_command([executable, "--version"], timeout=5) if Path(executable).exists() else None
+
+
+def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    """Observe declared user services, including inactive installed units.
+
+    Node agents deliberately run as the Ansible login user.  The ordinary
+    system service listing cannot see either their Linux systemd --user unit
+    or macOS LaunchAgent, so this is a separate, narrow probe rather than a
+    change to the system-service contract.
+    """
+    summary: dict[str, Any] = {"available": False, "important_services": [], "updated_at": collected_at}
+    if "node-agent" not in service_probe_hints(config):
+        return summary
+
+    version = _node_agent_version()
+    if platform.system() == "Linux" and shutil.which("systemctl"):
+        output = run_command(
+            ["systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"], timeout=5
+        )
+        if output is None:
+            return summary
+        summary["available"] = True
+        for unit in parse_systemd_units(output):
+            if unit.get("unit") != "opencode.service":
+                continue
+            summary["important_services"].append(
+                {"service": "node-agent", "unit": unit.get("unit"), "state": "active" if unit.get("active") == "active" else unit.get("active"), "sub_state": unit.get("sub"), "version": version}
+            )
+        return summary
+
+    if platform.system() == "Darwin" and shutil.which("launchctl"):
+        # A plist retained on disk but not loaded is an installed stopped
+        # LaunchAgent; retain it as inactive so drift is repairable, not
+        # indistinguishable from an absent service.
+        label = "com.clusterintent.opencode.agent"
+        plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+        output = run_command(["launchctl", "list", label], timeout=5)
+        if output is not None or plist.is_file():
+            summary["available"] = True
+            state = "active" if output is not None and not output.startswith("-") else "inactive"
+            summary["important_services"].append(
+                {"service": "node-agent", "label": label, "state": state, "version": version}
+            )
+    return summary
+
+
 def observe_managed_file(path_str: str, collected_at: str) -> dict[str, Any]:
     """Return one closed managed-file observation for `path_str`.
 
@@ -1026,6 +1076,7 @@ def normalize_observed_services(
     systemd: dict[str, Any],
     collected_at: str,
     primary_ip: str | None,
+    user_services: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     observed: dict[str, Any] = {}
 
@@ -1066,6 +1117,21 @@ def normalize_observed_services(
             "endpoint": endpoint_from_hint_or_port(name, config, [], primary_ip),
             "unit": item.get("unit"),
             "sub_state": item.get("sub_state"),
+            "checked_at": collected_at,
+        }
+
+    for item in (user_services or {}).get("important_services", []) if isinstance((user_services or {}).get("important_services"), list) else []:
+        if not isinstance(item, dict) or not item.get("service"):
+            continue
+        name = str(item["service"])
+        observed[name] = {
+            "state": item.get("state"),
+            "source": "systemd_user" if item.get("unit") else "launchd",
+            "endpoint": endpoint_from_hint_or_port(name, config, [], primary_ip),
+            "unit": item.get("unit"),
+            "label": item.get("label"),
+            "sub_state": item.get("sub_state"),
+            "version": item.get("version"),
             "checked_at": collected_at,
         }
 
@@ -1123,10 +1189,12 @@ def normalize_observed_services(
 def get_service_summary(config: dict[str, Any], collected_at: str, primary_ip: str | None) -> dict[str, Any]:
     docker = get_docker_summary(config, collected_at)
     systemd = get_systemd_summary(config, collected_at)
-    observed_services = normalize_observed_services(config, docker, systemd, collected_at, primary_ip)
+    user_services = get_user_service_summary(config, collected_at)
+    observed_services = normalize_observed_services(config, docker, systemd, collected_at, primary_ip, user_services)
     return {
         "docker": docker,
         "systemd": systemd,
+        "user_services": user_services,
         "observed_services": observed_services,
     }
 

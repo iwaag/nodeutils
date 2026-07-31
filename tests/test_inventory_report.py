@@ -110,6 +110,33 @@ class InventoryReportTests(unittest.TestCase):
             "prometheus-node-exporter",
         )
 
+    def test_node_agent_linux_user_unit_reports_active_and_inactive_states(self) -> None:
+        config = {"service_probe_hints": {"node-agent": {}}}
+        unit_output = "opencode.service loaded inactive dead OpenCode node agent\n"
+
+        with (
+            mock.patch.object(nodeutils_collect.platform, "system", return_value="Linux"),
+            mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/systemctl"),
+            mock.patch.object(nodeutils_collect, "_node_agent_version", return_value="1.18.10"),
+            mock.patch.object(nodeutils_collect, "run_command", return_value=unit_output) as command,
+        ):
+            summary = nodeutils_collect.get_user_service_summary(config, "2026-07-31T00:00:00+00:00")
+
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["important_services"][0]["state"], "inactive")
+        self.assertEqual(summary["important_services"][0]["version"], "1.18.10")
+        self.assertEqual(command.call_args.args[0][:3], ["systemctl", "--user", "list-units"])
+
+    def test_node_agent_user_service_is_normalized_without_configuration_contents(self) -> None:
+        observed = nodeutils_collect.normalize_observed_services(
+            {"service_probe_hints": {"node-agent": {}}}, {}, {}, "2026-07-31T00:00:00+00:00", None,
+            {"important_services": [{"service": "node-agent", "unit": "opencode.service", "state": "active", "version": "1.18.10"}]},
+        )
+
+        self.assertEqual(observed["node-agent"]["source"], "systemd_user")
+        self.assertEqual(observed["node-agent"]["state"], "active")
+        self.assertEqual(observed["node-agent"]["version"], "1.18.10")
+
     def test_observe_managed_file_present_reports_digest_size_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "records.conf"
