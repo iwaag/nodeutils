@@ -112,7 +112,7 @@ class InventoryReportTests(unittest.TestCase):
 
     def test_node_agent_linux_user_unit_reports_active_and_inactive_states(self) -> None:
         config = {"service_probe_hints": {"node-agent": {}}}
-        unit_output = "opencode.service loaded inactive dead OpenCode node agent\n"
+        unit_output = "opencode-agent.service loaded inactive dead OpenCode node agent\n"
 
         with (
             mock.patch.object(nodeutils_collect.platform, "system", return_value="Linux"),
@@ -130,7 +130,7 @@ class InventoryReportTests(unittest.TestCase):
     def test_node_agent_user_service_is_normalized_without_configuration_contents(self) -> None:
         observed = nodeutils_collect.normalize_observed_services(
             {"service_probe_hints": {"node-agent": {}}}, {}, {}, "2026-07-31T00:00:00+00:00", None,
-            {"important_services": [{"service": "node-agent", "unit": "opencode.service", "state": "active", "version": "1.18.10"}]},
+            {"important_services": [{"service": "node-agent", "unit": "opencode-agent.service", "state": "active", "version": "1.18.10"}]},
         )
 
         self.assertEqual(observed["node-agent"]["source"], "systemd_user")

@@ -987,7 +987,7 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
             return summary
         summary["available"] = True
         for unit in parse_systemd_units(output):
-            if unit.get("unit") != "opencode.service":
+            if unit.get("unit") != "opencode-agent.service":
                 continue
             summary["important_services"].append(
                 {"service": "node-agent", "unit": unit.get("unit"), "state": "active" if unit.get("active") == "active" else unit.get("active"), "sub_state": unit.get("sub"), "version": version}
