@@ -1016,6 +1016,17 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
             if service_version:
                 entry["version"] = service_version
             summary["important_services"].append(entry)
+
+    # Ollama can also be started directly by a developer or desktop app
+    # without retaining the expected launchd label. The desired probe hint
+    # keeps this narrow: do not scan arbitrary processes on every host.
+    if "ollama" in hints and not any(item.get("service") == "ollama" for item in summary["important_services"]):
+        output = run_command(["pgrep", "-x", "ollama"], timeout=5)
+        if output:
+            summary["available"] = True
+            summary["important_services"].append(
+                {"service": "ollama", "process": "ollama", "state": "active"}
+            )
     return summary
 
 
@@ -1135,10 +1146,11 @@ def normalize_observed_services(
         name = str(item["service"])
         observed[name] = {
             "state": item.get("state"),
-            "source": "systemd_user" if item.get("unit") else "launchd",
+            "source": "systemd_user" if item.get("unit") else "process" if item.get("process") else "launchd",
             "endpoint": endpoint_from_hint_or_port(name, config, [], primary_ip),
             "unit": item.get("unit"),
             "label": item.get("label"),
+            "process": item.get("process"),
             "sub_state": item.get("sub_state"),
             "version": item.get("version"),
             "checked_at": collected_at,
