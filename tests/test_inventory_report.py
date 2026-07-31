@@ -170,6 +170,20 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(observed["node-agent"]["state"], "active")
         self.assertEqual(observed["node-agent"]["version"], "1.18.10")
 
+    def test_ollama_endpoint_probe_registers_active_service(self) -> None:
+        response = mock.MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", return_value=response):
+            observed = nodeutils_collect.normalize_observed_services(
+                {"service_probe_hints": {"ollama": {"endpoint": "http://agstudio.home.arpa:11434"}}},
+                {}, {}, "2026-07-31T00:00:00+00:00", None,
+            )
+
+        self.assertEqual(observed["ollama"]["state"], "active")
+        self.assertEqual(observed["ollama"]["source"], "http_probe")
+        self.assertEqual(observed["ollama"]["endpoint"], "http://agstudio.home.arpa:11434")
+
     def test_observe_managed_file_present_reports_digest_size_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "records.conf"

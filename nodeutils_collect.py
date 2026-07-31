@@ -18,6 +18,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -1156,6 +1158,27 @@ def normalize_observed_services(
             "checked_at": collected_at,
         }
 
+    # A provider may be managed by a desktop application and therefore have
+    # neither a stable container nor a visible launchd/systemd unit. For the
+    # narrow set of desired service endpoints, a successful local API probe is
+    # valid actual-service evidence and also verifies client reachability.
+    for service_name, hint in service_probe_hints(config).items():
+        endpoint = hint.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            continue
+        status = probe_service_endpoint(service_name, endpoint)
+        if status is None:
+            continue
+        existing = observed.get(service_name, {})
+        observed[service_name] = {
+            **existing,
+            "state": "active" if 200 <= status < 300 else "unreachable",
+            "source": "http_probe",
+            "endpoint": endpoint,
+            "http_status": status,
+            "checked_at": collected_at,
+        }
+
     # fix_sshkey3 Step 4: a hinted managed-file observation is attached (and
     # the service entry created if docker/systemd never independently
     # detected it) for every `service_probe_hints` entry that configures
@@ -1205,6 +1228,18 @@ def normalize_observed_services(
         service_name: {key: value for key, value in data.items() if value not in (None, "", [], {})}
         for service_name, data in sorted(observed.items())
     }
+
+
+def probe_service_endpoint(service_name: str, endpoint: str) -> int | None:
+    """Return a bounded health status for supported desired service APIs."""
+
+    if service_name != "ollama":
+        return None
+    try:
+        with urllib.request.urlopen(f"{endpoint.rstrip('/')}/api/tags", timeout=3) as response:
+            return int(response.status)
+    except (OSError, ValueError, urllib.error.HTTPError):
+        return None
 
 
 def get_service_summary(config: dict[str, Any], collected_at: str, primary_ip: str | None) -> dict[str, Any]:
