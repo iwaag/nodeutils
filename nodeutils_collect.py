@@ -1235,11 +1235,13 @@ def probe_service_endpoint(service_name: str, endpoint: str) -> int | None:
 
     if service_name != "ollama":
         return None
-    try:
-        with urllib.request.urlopen(f"{endpoint.rstrip('/')}/api/tags", timeout=3) as response:
-            return int(response.status)
-    except (OSError, ValueError, urllib.error.HTTPError):
-        return None
+    for path in ("/v1/models", "/api/tags"):
+        try:
+            with urllib.request.urlopen(f"{endpoint.rstrip('/')}{path}", timeout=3) as response:
+                return int(response.status)
+        except (OSError, ValueError, urllib.error.HTTPError):
+            continue
+    return None
 
 
 def get_service_summary(config: dict[str, Any], collected_at: str, primary_ip: str | None) -> dict[str, Any]:
