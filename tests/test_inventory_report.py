@@ -291,6 +291,123 @@ class InventoryReportTests(unittest.TestCase):
             self.assertEqual(observed["dnsmasq"]["state"], "active")
             self.assertEqual(observed["dnsmasq"]["managed_files"]["records"]["status"], "present")
 
+    # --- bindings (service_relation Phase 3) ---------------------------------
+
+    def test_observe_binding_present_and_reachable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "opencode.json"
+            path.write_text(json.dumps({"provider": {"ollama": {"options": {"baseURL": "http://agstudio.home.arpa:11434/v1"}}}}))
+            spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
+
+            response = mock.MagicMock()
+            response.status = 200
+            response.__enter__.return_value = response
+            with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", return_value=response) as urlopen:
+                entry = nodeutils_collect.observe_binding(spec, "2026-08-01T00:00:00+00:00")
+
+            self.assertEqual(entry["configuration_status"], "present")
+            self.assertEqual(entry["configured_endpoint"], "http://agstudio.home.arpa:11434/v1")
+            self.assertEqual(entry["reachability_status"], "reachable")
+            self.assertEqual(entry["http_status"], 200)
+            self.assertEqual(entry["checked_at"], "2026-08-01T00:00:00+00:00")
+            self.assertEqual(urlopen.call_args.args[0], "http://agstudio.home.arpa:11434/v1/models")
+
+    def test_observe_binding_unreachable_when_probe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "opencode.json"
+            path.write_text(json.dumps({"provider": {"ollama": {"options": {"baseURL": "http://dead.example:11434/v1"}}}}))
+            spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
+
+            with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", side_effect=OSError("no route")):
+                entry = nodeutils_collect.observe_binding(spec, "2026-08-01T00:00:00+00:00")
+
+            self.assertEqual(entry["configuration_status"], "present")
+            self.assertEqual(entry["reachability_status"], "unreachable")
+            self.assertNotIn("http_status", entry)
+
+    def test_observe_binding_absent_when_config_file_missing(self) -> None:
+        spec = {"config_file": "/nonexistent/opencode.json", "json_path": "provider.ollama.options.baseURL"}
+
+        entry = nodeutils_collect.observe_binding(spec, "2026-08-01T00:00:00+00:00")
+
+        self.assertEqual(entry["configuration_status"], "absent")
+        self.assertNotIn("configured_endpoint", entry)
+
+    def test_observe_binding_absent_when_slot_missing_from_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "opencode.json"
+            path.write_text(json.dumps({"provider": {}}))
+            spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
+
+            entry = nodeutils_collect.observe_binding(spec, "2026-08-01T00:00:00+00:00")
+
+            self.assertEqual(entry["configuration_status"], "absent")
+
+    def test_observe_binding_unreadable_when_json_is_malformed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "opencode.json"
+            path.write_text("{not valid json")
+            spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
+
+            entry = nodeutils_collect.observe_binding(spec, "2026-08-01T00:00:00+00:00")
+
+            self.assertEqual(entry["configuration_status"], "unreadable")
+
+    def test_observe_binding_expands_home_relative_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "opencode.json"
+            path.write_text(json.dumps({"a": {"b": "http://x:1/v1"}}))
+            spec = {"config_file": str(path), "json_path": "a.b"}
+
+            with mock.patch.object(Path, "expanduser", return_value=path):
+                with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", side_effect=OSError()):
+                    entry = nodeutils_collect.observe_binding({"config_file": "~/opencode.json", "json_path": "a.b"}, "t")
+
+            self.assertEqual(entry["configuration_status"], "present")
+            self.assertEqual(entry["configured_endpoint"], "http://x:1/v1")
+
+    def test_no_secret_value_survives_bounded_value_in_a_binding_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "opencode.json"
+            path.write_text(json.dumps({"a": {"b": "x" * 600}}))
+            spec = {"config_file": str(path), "json_path": "a.b"}
+
+            with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", side_effect=OSError()):
+                entry = nodeutils_collect.observe_binding(spec, "t")
+
+            self.assertLessEqual(len(entry["configured_endpoint"]), nodeutils_collect.MAX_STRING_LENGTH + len("...[truncated]"))
+
+    def test_bindings_for_service_rejects_malformed_spec(self) -> None:
+        config = {"service_probe_hints": {"node-agent": {"bindings": {"llm_provider": "not-a-mapping"}}}}
+
+        results = nodeutils_collect.bindings_for_service("node-agent", config, "2026-08-01T00:00:00+00:00")
+
+        self.assertEqual(results, {})
+
+    def test_normalize_observed_services_attaches_bindings_without_docker_or_systemd_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "opencode.json"
+            path.write_text(json.dumps({"provider": {"ollama": {"options": {"baseURL": "http://agstudio.home.arpa:11434/v1"}}}}))
+            config = {
+                "service_probe_hints": {
+                    "node-agent": {
+                        "bindings": {
+                            "llm_provider": {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"},
+                        },
+                    },
+                }
+            }
+
+            with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", side_effect=OSError()):
+                observed = nodeutils_collect.normalize_observed_services(
+                    config, {}, {}, "2026-08-01T00:00:00+00:00", None,
+                )
+
+            self.assertIn("node-agent", observed)
+            self.assertEqual(observed["node-agent"]["source"], "probe")
+            self.assertEqual(observed["node-agent"]["bindings"]["llm_provider"]["configuration_status"], "present")
+            self.assertEqual(observed["node-agent"]["bindings"]["llm_provider"]["reachability_status"], "unreachable")
+
     def test_no_file_content_ever_appears_in_a_managed_file_observation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "nintent-records.conf"

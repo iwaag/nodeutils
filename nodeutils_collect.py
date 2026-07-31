@@ -53,6 +53,10 @@ MAX_REPORT_BYTES = 2 * 1024 * 1024
 # than read into memory -- this is a metadata probe, never a general-purpose
 # file transfer or integrity-monitoring tool.
 MAX_MANAGED_FILE_BYTES = 4 * 1024 * 1024
+# Bounded text read for a binding config-slot observation (service_relation
+# Phase 3). Only the one allowlisted JSON key is ever reported back -- this
+# bound just keeps a malformed/huge file from being parsed into memory.
+MAX_BINDING_CONFIG_BYTES = 1 * 1024 * 1024
 SUSPICIOUS_KEY_PARTS = ("token", "secret", "password", "passwd", "credential", "apikey", "api_key")
 DEFAULT_CONFIG: dict[str, Any] = {
     "include_all_docker_containers": True,
@@ -1092,6 +1096,97 @@ def managed_files_for_service(service_name: str, config: dict[str, Any], collect
     return results
 
 
+def _read_json_path(data: Any, json_path: str) -> Any:
+    current = data
+    for part in json_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def probe_binding_endpoint(endpoint: str) -> int | None:
+    """Bounded ~3s reachability probe against a binding's configured endpoint.
+
+    Runs on the consumer node against the *configured* value (never the
+    desired one) -- the agstudio DNS incident is the reference case for why
+    this must be a consumer-side, not controller-side, probe. Reuses
+    `probe_service_endpoint`'s ollama shape: the configured endpoint already
+    ends in `/v1`, so `<configured>/models` is the health check.
+    """
+    try:
+        with urllib.request.urlopen(f"{endpoint.rstrip('/')}/models", timeout=3) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except (OSError, ValueError):
+        return None
+
+
+def observe_binding(spec: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    """Return one closed binding observation for `spec` (service_relation Phase 3).
+
+    Reads only the one allowlisted JSON key from the config file -- never
+    the rest of the file, other keys, or credentials -- and probes it when
+    present. `configuration_status`: `present` = file read and slot a
+    non-empty string; `absent` = file, path, or slot missing/empty (idea-A
+    §6 `unbound`); `unreadable` = file exists but cannot be read or parsed.
+    No configured value means no probe.
+    """
+    entry: dict[str, Any] = {"checked_at": collected_at}
+    config_file = spec.get("config_file")
+    json_path = spec.get("json_path")
+    if not isinstance(config_file, str) or not config_file or not isinstance(json_path, str) or not json_path:
+        entry["configuration_status"] = "absent"
+        return entry
+    path = Path(config_file).expanduser()
+    try:
+        file_stat = path.stat()
+    except FileNotFoundError:
+        entry["configuration_status"] = "absent"
+        return entry
+    except OSError:
+        entry["configuration_status"] = "unreadable"
+        return entry
+    if not path.is_file():
+        entry["configuration_status"] = "absent"
+        return entry
+    if file_stat.st_size > MAX_BINDING_CONFIG_BYTES:
+        entry["configuration_status"] = "unreadable"
+        return entry
+    try:
+        parsed = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        entry["configuration_status"] = "unreadable"
+        return entry
+    value = _read_json_path(parsed, json_path)
+    if not isinstance(value, str) or not value:
+        entry["configuration_status"] = "absent"
+        return entry
+    entry["configuration_status"] = "present"
+    entry["configured_endpoint"] = bounded_value(value)
+    status = probe_binding_endpoint(value)
+    entry["reachability_status"] = "reachable" if status is not None and 200 <= status < 300 else "unreachable"
+    if status is not None:
+        entry["http_status"] = status
+    return entry
+
+
+def bindings_for_service(service_name: str, config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    """Return `{binding_name: observe_binding(...)}` for one service's `bindings` hint."""
+
+    hint = service_probe_hints(config).get(service_name, {})
+    bindings = hint.get("bindings")
+    if not isinstance(bindings, dict):
+        return {}
+    results: dict[str, Any] = {}
+    for key, spec in bindings.items():
+        if not isinstance(spec, dict):
+            continue
+        results[str(key)] = observe_binding(spec, collected_at)
+    return results
+
+
 def normalize_observed_services(
     config: dict[str, Any],
     docker: dict[str, Any],
@@ -1192,6 +1287,19 @@ def normalize_observed_services(
             continue
         existing = observed.get(service_name, {"source": "probe"})
         observed[service_name] = {**existing, "managed_files": managed_files}
+
+    # service_relation Phase 3: same attach-and-create pattern as
+    # managed_files above, for every `service_probe_hints` entry that
+    # configures `bindings` -- a consumer's binding evidence must be
+    # observable even when its own process isn't independently detected.
+    for service_name, hint in service_probe_hints(config).items():
+        if "bindings" not in hint:
+            continue
+        bindings = bindings_for_service(service_name, config, collected_at)
+        if not bindings:
+            continue
+        existing = observed.get(service_name, {"source": "probe"})
+        observed[service_name] = {**existing, "bindings": bindings}
 
     # Host tools and Docker images probing for non-daemon runtimes (e.g. blender, vdbmat-openvdb-cycles)
     for tool_name, possible_paths in [("blender", ["/snap/bin/blender", "/usr/bin/blender"])]:
