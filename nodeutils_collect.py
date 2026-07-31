@@ -975,7 +975,8 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
     change to the system-service contract.
     """
     summary: dict[str, Any] = {"available": False, "important_services": [], "updated_at": collected_at}
-    if "node-agent" not in service_probe_hints(config):
+    hints = service_probe_hints(config)
+    if not {"node-agent", "ollama"} & set(hints):
         return summary
 
     version = _node_agent_version()
@@ -997,16 +998,24 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
     if platform.system() == "Darwin" and shutil.which("launchctl"):
         # A plist retained on disk but not loaded is an installed stopped
         # LaunchAgent; retain it as inactive so drift is repairable, not
-        # indistinguishable from an absent service.
-        label = "com.clusterintent.opencode.agent"
-        plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
-        output = run_command(["launchctl", "list", label], timeout=5)
-        if output is not None or plist.is_file():
+        # indistinguishable from an absent service. Ollama.app registers the
+        # documented launchd label without requiring a user-local plist.
+        launch_agents = []
+        if "node-agent" in hints:
+            launch_agents.append(("node-agent", "com.clusterintent.opencode.agent", version, True))
+        if "ollama" in hints:
+            launch_agents.append(("ollama", "com.ollama.ollama", None, False))
+        for service, label, service_version, has_local_plist in launch_agents:
+            plist = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+            output = run_command(["launchctl", "list", label], timeout=5)
+            if output is None and (not has_local_plist or not plist.is_file()):
+                continue
             summary["available"] = True
             state = "active" if output is not None and not output.startswith("-") else "inactive"
-            summary["important_services"].append(
-                {"service": "node-agent", "label": label, "state": state, "version": version}
-            )
+            entry = {"service": service, "label": label, "state": state}
+            if service_version:
+                entry["version"] = service_version
+            summary["important_services"].append(entry)
     return summary
 
 

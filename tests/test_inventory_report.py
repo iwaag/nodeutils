@@ -127,6 +127,23 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(summary["important_services"][0]["version"], "1.18.10")
         self.assertEqual(command.call_args.args[0][:3], ["systemctl", "--user", "list-units"])
 
+    def test_ollama_macos_launchd_service_is_observed_when_requested(self) -> None:
+        config = {"service_probe_hints": {"ollama": {}}}
+
+        with (
+            mock.patch.object(nodeutils_collect.platform, "system", return_value="Darwin"),
+            mock.patch.object(nodeutils_collect.shutil, "which", return_value="/bin/launchctl"),
+            mock.patch.object(nodeutils_collect, "_node_agent_version", return_value=None),
+            mock.patch.object(nodeutils_collect, "run_command", return_value="123\t0\tcom.ollama.ollama") as command,
+        ):
+            summary = nodeutils_collect.get_user_service_summary(config, "2026-07-31T00:00:00+00:00")
+
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["important_services"], [
+            {"service": "ollama", "label": "com.ollama.ollama", "state": "active"}
+        ])
+        self.assertEqual(command.call_args.args[0], ["launchctl", "list", "com.ollama.ollama"])
+
     def test_node_agent_user_service_is_normalized_without_configuration_contents(self) -> None:
         observed = nodeutils_collect.normalize_observed_services(
             {"service_probe_hints": {"node-agent": {}}}, {}, {}, "2026-07-31T00:00:00+00:00", None,
