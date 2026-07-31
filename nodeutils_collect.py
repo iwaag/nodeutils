@@ -1166,7 +1166,10 @@ def normalize_observed_services(
         endpoint = hint.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint:
             continue
-        status = probe_service_endpoint(service_name, endpoint)
+        local_endpoint = hint.get("local_endpoint")
+        status = probe_service_endpoint(
+            service_name, endpoint, local_endpoint if isinstance(local_endpoint, str) else None
+        )
         if status is None:
             continue
         existing = observed.get(service_name, {})
@@ -1230,17 +1233,20 @@ def normalize_observed_services(
     }
 
 
-def probe_service_endpoint(service_name: str, endpoint: str) -> int | None:
+def probe_service_endpoint(service_name: str, endpoint: str, local_endpoint: str | None = None) -> int | None:
     """Return a bounded health status for supported desired service APIs."""
 
     if service_name != "ollama":
         return None
-    for path in ("/v1/models", "/api/tags"):
-        try:
-            with urllib.request.urlopen(f"{endpoint.rstrip('/')}{path}", timeout=3) as response:
-                return int(response.status)
-        except (OSError, ValueError, urllib.error.HTTPError):
+    for base_url in (endpoint, local_endpoint):
+        if not base_url:
             continue
+        for path in ("/v1/models", "/api/tags"):
+            try:
+                with urllib.request.urlopen(f"{base_url.rstrip('/')}{path}", timeout=3) as response:
+                    return int(response.status)
+            except (OSError, ValueError, urllib.error.HTTPError):
+                continue
     return None
 
 
