@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -417,6 +418,117 @@ class InventoryReportTests(unittest.TestCase):
             entry = nodeutils_collect.observe_managed_file(str(path), "2026-07-22T00:00:00+00:00")
 
             self.assertNotIn(secret_line, json.dumps(entry))
+
+
+def _init_git_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "test"], check=True)
+
+
+def _commit_all(path: Path, message: str) -> None:
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", message], check=True)
+
+
+class ObserveWorkspaceTests(unittest.TestCase):
+    def test_missing_path_is_present_false(self) -> None:
+        entry = nodeutils_collect.observe_workspace(
+            {"path": "/nonexistent/pj-example"}, "2026-08-01T00:00:00+00:00"
+        )
+
+        self.assertEqual(entry["present"], False)
+        self.assertNotIn("head_sha", entry)
+
+    def test_non_git_directory_is_present_with_no_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entry = nodeutils_collect.observe_workspace({"path": tmpdir}, "2026-08-01T00:00:00+00:00")
+
+        self.assertEqual(entry["present"], True)
+        self.assertEqual(entry["raw"]["is_git"], False)
+        self.assertNotIn("head_sha", entry)
+        self.assertNotIn("remote_url", entry)
+
+    def test_present_clean_git_repo_reports_identity_and_not_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_git_repo(path)
+            (path / "f.txt").write_text("hello")
+            _commit_all(path, "init")
+
+            entry = nodeutils_collect.observe_workspace({"path": str(path)}, "2026-08-01T00:00:00+00:00")
+
+        self.assertEqual(entry["present"], True)
+        self.assertEqual(entry["branch"], "main")
+        self.assertEqual(entry["dirty"], False)
+        self.assertIn("head_sha", entry)
+        self.assertIn("last_commit_at", entry)
+        self.assertNotIn("ahead", entry)
+        self.assertNotIn("behind", entry)
+
+    def test_present_dirty_and_ahead_of_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            remote = base / "remote.git"
+            work = base / "work"
+            subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+            work.mkdir()
+            _init_git_repo(work)
+            (work / "f.txt").write_text("hello")
+            _commit_all(work, "init")
+            subprocess.run(["git", "-C", str(work), "remote", "add", "origin", str(remote)], check=True)
+            subprocess.run(["git", "-C", str(work), "push", "-q", "-u", "origin", "main"], check=True)
+            (work / "f.txt").write_text("changed")
+            _commit_all(work, "local change")
+            (work / "untracked.txt").write_text("wip")
+
+            entry = nodeutils_collect.observe_workspace({"path": str(work)}, "2026-08-01T00:00:00+00:00")
+
+        self.assertEqual(entry["present"], True)
+        self.assertEqual(entry["dirty"], True)
+        self.assertEqual(entry["ahead"], 1)
+        self.assertEqual(entry["behind"], 0)
+        self.assertEqual(entry["remote_url"], str(remote))
+
+    def test_individual_git_command_failure_yields_partial_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_git_repo(path)
+            (path / "f.txt").write_text("hello")
+            _commit_all(path, "init")
+
+            real_run_git = nodeutils_collect.run_git
+
+            def flaky_run_git(target: Path, args: list, timeout: int = 8):
+                if args[:1] == ["log"]:
+                    return None
+                return real_run_git(target, args, timeout=timeout)
+
+            with mock.patch.object(nodeutils_collect, "run_git", side_effect=flaky_run_git):
+                entry = nodeutils_collect.observe_workspace({"path": str(path)}, "2026-08-01T00:00:00+00:00")
+
+        self.assertEqual(entry["present"], True)
+        self.assertIn("head_sha", entry)
+        self.assertNotIn("last_commit_at", entry)
+
+    def test_workspace_probe_hints_ignores_malformed_entries(self) -> None:
+        config = {"workspace_probe_hints": {"pj-example": {"path": "/x"}, "bad": "not-a-mapping"}}
+
+        hints = nodeutils_collect.workspace_probe_hints(config)
+
+        self.assertEqual(hints, {"pj-example": {"path": "/x"}})
+
+    def test_get_workspace_summary_keys_by_hint_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {"workspace_probe_hints": {"pj-example": {"path": tmpdir}}}
+
+            summary = nodeutils_collect.get_workspace_summary(config, "2026-08-01T00:00:00+00:00")
+
+        self.assertIn("pj-example", summary)
+        self.assertEqual(summary["pj-example"]["present"], True)
+
+    def test_pj_voxel3dprint_is_no_longer_a_hardcoded_important_service(self) -> None:
+        self.assertNotIn("pj-voxel3dprint", nodeutils_collect.IMPORTANT_SERVICE_NAMES)
 
 
 if __name__ == "__main__":

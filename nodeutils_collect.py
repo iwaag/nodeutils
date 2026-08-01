@@ -71,7 +71,6 @@ IMPORTANT_SERVICE_NAMES = (
     "prometheus",
     "postgres",
     "redis",
-    "pj-voxel3dprint",
     "vdbmat-openvdb-cycles",
     "blender",
 )
@@ -1036,6 +1035,118 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
     return summary
 
 
+def workspace_probe_hints(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    hints = config.get("workspace_probe_hints")
+    if not isinstance(hints, dict):
+        return {}
+    return {
+        str(name): value
+        for name, value in hints.items()
+        if name not in (None, "") and isinstance(value, dict)
+    }
+
+
+def run_git(path: Path, args: list[str], timeout: int = 8) -> str | None:
+    """Run a bounded, metadata-only git command against `path`.
+
+    `-c safe.directory=<path>` works around git's "detected dubious
+    ownership" refusal when the collector runs as a different user than the
+    workspace owner (creative_workspace p1 plan) -- it is a metadata-only
+    trust override scoped to this one invocation, not a global config change.
+    """
+    return run_command(["git", "-c", f"safe.directory={path}", "-C", str(path), *args], timeout=timeout)
+
+
+def parse_git_status_v2(output: str) -> dict[str, Any]:
+    info: dict[str, Any] = {"dirty": False}
+    for line in output.splitlines():
+        if line.startswith("# branch.head "):
+            info["branch"] = line.split(" ", 2)[2]
+        elif line.startswith("# branch.upstream "):
+            info["upstream"] = line.split(" ", 2)[2]
+        elif line.startswith("# branch.ab "):
+            for part in line.split()[2:]:
+                if part.startswith("+") and part[1:].isdigit():
+                    info["ahead"] = int(part[1:])
+                elif part.startswith("-") and part[1:].isdigit():
+                    info["behind"] = int(part[1:])
+        elif line.startswith("#"):
+            continue
+        else:
+            info["dirty"] = True
+    return info
+
+
+def observe_workspace(hint: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    """Return one closed workspace observation, never raising.
+
+    Handles a missing path, a present-but-non-git directory, and an
+    individual failed git command as normal observation results (roadmap
+    hard rule 4 / p1 plan) -- never a collector error. Ahead/behind is only
+    as fresh as the last fetch; this collector intentionally never fetches.
+    """
+    entry: dict[str, Any] = {"checked_at": collected_at}
+    path_str = hint.get("path")
+    if not isinstance(path_str, str) or not path_str or not Path(path_str).is_absolute():
+        entry["present"] = False
+        return entry
+
+    entry["path"] = path_str
+    path = Path(path_str)
+    if not path.is_dir():
+        entry["present"] = False
+        return entry
+    entry["present"] = True
+
+    raw: dict[str, Any] = {}
+    if run_git(path, ["rev-parse", "--is-inside-work-tree"]) != "true":
+        raw["is_git"] = False
+        entry["raw"] = raw
+        return entry
+
+    head_sha = run_git(path, ["rev-parse", "HEAD"])
+    if head_sha:
+        entry["head_sha"] = head_sha
+
+    remote_url = run_git(path, ["config", "--get", "remote.origin.url"])
+    if remote_url:
+        entry["remote_url"] = remote_url
+
+    last_commit_at = run_git(path, ["log", "-1", "--format=%cI"])
+    if last_commit_at:
+        entry["last_commit_at"] = last_commit_at
+
+    status_output = run_git(path, ["status", "--porcelain=v2", "--branch"])
+    if status_output is not None:
+        status_info = parse_git_status_v2(status_output)
+        entry["dirty"] = status_info["dirty"]
+        for key in ("branch", "ahead", "behind"):
+            if key in status_info:
+                entry[key] = status_info[key]
+        if "upstream" in status_info:
+            raw["upstream"] = status_info["upstream"]
+
+    submodule_output = run_git(path, ["submodule", "status"])
+    if submodule_output:
+        raw["submodule_status"] = submodule_output.splitlines()
+
+    stash_output = run_git(path, ["stash", "list"])
+    if stash_output is not None:
+        raw["stash_count"] = len(stash_output.splitlines())
+
+    if raw:
+        entry["raw"] = raw
+    return entry
+
+
+def get_workspace_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    hints = workspace_probe_hints(config)
+    return {
+        name: compact_dict(observe_workspace(hint, collected_at))
+        for name, hint in sorted(hints.items())
+    }
+
+
 def observe_managed_file(path_str: str, collected_at: str) -> dict[str, Any]:
     """Return one closed managed-file observation for `path_str`.
 
@@ -1420,6 +1531,7 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
     disk_summary = get_disk_summary()
     gpu_summary = get_gpu_summary(system)
     service_summary = get_service_summary(config, now, primary_ip)
+    workspace_summary = get_workspace_summary(config, now)
 
     cpu_physical = psutil.cpu_count(logical=False) if psutil is not None else None
     cpu_logical = psutil.cpu_count(logical=True) if psutil is not None else os.cpu_count()
@@ -1462,6 +1574,7 @@ def collect_inventory(config: dict[str, Any]) -> dict[str, Any]:
         "docker": service_summary.get("docker"),
         "systemd": service_summary.get("systemd"),
         "observed_services": service_summary.get("observed_services"),
+        "observed_workspaces": workspace_summary,
         "docker_service_summary": make_docker_service_summary(service_summary),
         "self_reported": {
             "owner": config.get("owner"),
@@ -1503,6 +1616,7 @@ def build_inventory_report(config: dict[str, Any], inventory: dict[str, Any]) ->
         "gpu": inventory.get("gpu"),
         "software": inventory.get("software"),
         "services": inventory.get("services"),
+        "workspaces": inventory.get("observed_workspaces"),
     }
     # facts.proxmox is validated and bounded by its own nodeutils.proxmox.v1 semantic limits
     # (see proxmox_inventory.py); it must never pass through the generic 200-item/200-key
