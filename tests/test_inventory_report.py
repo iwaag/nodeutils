@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import nodeutils_collect
+import service_endpoint_probes
 
 GOLDEN_DNSMASQ_SHA256 = "c25e51c4efce07281e580dcfb1ecad73d666a70310f87cd28ad448241215e592"
 
@@ -175,7 +176,9 @@ class InventoryReportTests(unittest.TestCase):
         response = mock.MagicMock()
         response.status = 200
         response.__enter__.return_value = response
-        with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", return_value=response):
+        with mock.patch.object(
+            service_endpoint_probes.urllib.request, "urlopen", return_value=response
+        ) as urlopen:
             observed = nodeutils_collect.normalize_observed_services(
                 {"service_probe_hints": {"ollama": {"endpoint": "http://agstudio.home.arpa:11434"}}},
                 {}, {}, "2026-07-31T00:00:00+00:00", None,
@@ -184,12 +187,15 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(observed["ollama"]["state"], "active")
         self.assertEqual(observed["ollama"]["source"], "http_probe")
         self.assertEqual(observed["ollama"]["endpoint"], "http://agstudio.home.arpa:11434")
+        urlopen.assert_called_once_with("http://agstudio.home.arpa:11434/v1/models", timeout=3)
 
     def test_swarmui_and_comfyui_endpoint_probes_register_active_service(self) -> None:
         response = mock.MagicMock()
         response.status = 200
         response.__enter__.return_value = response
-        with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", return_value=response):
+        with mock.patch.object(
+            service_endpoint_probes.urllib.request, "urlopen", return_value=response
+        ) as urlopen:
             observed = nodeutils_collect.normalize_observed_services(
                 {
                     "service_probe_hints": {
@@ -204,6 +210,20 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(observed["swarmui"]["source"], "http_probe")
         self.assertEqual(observed["comfyui"]["state"], "active")
         self.assertEqual(observed["comfyui"]["source"], "http_probe")
+        self.assertEqual(
+            urlopen.call_args_list,
+            [
+                mock.call("http://agpc.local:7801/", timeout=3),
+                mock.call("http://127.0.0.1:7821/", timeout=3),
+            ],
+        )
+
+    def test_unregistered_service_endpoint_is_not_probed(self) -> None:
+        with mock.patch.object(service_endpoint_probes.urllib.request, "urlopen") as urlopen:
+            status = service_endpoint_probes.probe_service_endpoint("unknown-service", "http://127.0.0.1:9999")
+
+        self.assertIsNone(status)
+        urlopen.assert_not_called()
 
 
     def test_observe_managed_file_present_reports_digest_size_and_status(self) -> None:

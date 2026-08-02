@@ -44,7 +44,7 @@ package = true
 nodeutils = "nodeutils_collect:main"
 
 [tool.setuptools]
-py-modules = ["nodeutils_collect", "proxmox_inventory"]
+py-modules = ["nodeutils_collect", "proxmox_inventory", "service_endpoint_probes"]
 
 [tool.setuptools.data-files]
 "share/nodeutils" = [
