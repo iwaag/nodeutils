@@ -1452,15 +1452,23 @@ def normalize_observed_services(
 def probe_service_endpoint(service_name: str, endpoint: str) -> int | None:
     """Return a bounded health status for supported desired service APIs."""
 
-    if service_name != "ollama":
+    if service_name == "ollama":
+        paths = ("/v1/models", "/api/tags")
+    elif service_name in ("swarmui", "comfyui"):
+        paths = ("/",)
+    else:
         return None
-    for path in ("/v1/models", "/api/tags"):
+
+    for path in paths:
         try:
             with urllib.request.urlopen(f"{endpoint.rstrip('/')}{path}", timeout=3) as response:
                 return int(response.status)
-        except (OSError, ValueError, urllib.error.HTTPError):
+        except urllib.error.HTTPError as exc:
+            return int(exc.code)
+        except (OSError, ValueError):
             continue
     return None
+
 
 
 def get_service_summary(config: dict[str, Any], collected_at: str, primary_ip: str | None) -> dict[str, Any]:

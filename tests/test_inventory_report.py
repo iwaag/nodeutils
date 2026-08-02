@@ -185,6 +185,27 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(observed["ollama"]["source"], "http_probe")
         self.assertEqual(observed["ollama"]["endpoint"], "http://agstudio.home.arpa:11434")
 
+    def test_swarmui_and_comfyui_endpoint_probes_register_active_service(self) -> None:
+        response = mock.MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", return_value=response):
+            observed = nodeutils_collect.normalize_observed_services(
+                {
+                    "service_probe_hints": {
+                        "swarmui": {"endpoint": "http://agpc.local:7801"},
+                        "comfyui": {"endpoint": "http://127.0.0.1:7821"},
+                    }
+                },
+                {}, {}, "2026-08-02T00:00:00+00:00", None,
+            )
+
+        self.assertEqual(observed["swarmui"]["state"], "active")
+        self.assertEqual(observed["swarmui"]["source"], "http_probe")
+        self.assertEqual(observed["comfyui"]["state"], "active")
+        self.assertEqual(observed["comfyui"]["source"], "http_probe")
+
+
     def test_observe_managed_file_present_reports_digest_size_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "records.conf"
