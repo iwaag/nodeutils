@@ -18,7 +18,15 @@
 #   hatchet:
 #     endpoint: "http://pc1:8080"
 #     systemd_unit: hatchet.service
+#   swarmui:
+#     # A service running as a plain user process (neither systemd nor docker)
+#     # is observable through an explicit process probe: `process` matches the
+#     # exact executable name (pgrep -x), `process_pattern` matches the full
+#     # command line (pgrep -f). Only hinted services are probed.
+#     process_pattern: "StabilityMatrix.*SwarmUI"
 #   dnsmasq:
+#     # Systemd detection matches a unit whose name stem equals the service
+#     # name exactly; any other unit name needs this explicit hint.
 #     systemd_unit: dnsmasq.service
 #     # Closed managed-file digest observation (fix_sshkey3 Step 4): the path
 #     # must be absolute (relative paths are silently rejected, never probed

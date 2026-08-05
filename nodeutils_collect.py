@@ -916,17 +916,19 @@ def parse_systemd_units(output: str | None) -> list[dict[str, Any]]:
 
 
 def important_service_name_from_systemd(unit: dict[str, Any], config: dict[str, Any]) -> str | None:
-    haystack = f"{unit.get('unit', '')} {unit.get('description', '')}".lower()
+    unit_name = str(unit.get("unit", "")).lower()
     hints = service_probe_hints(config)
     for service_name, hint in sorted(hints.items()):
         systemd_unit = hint.get("systemd_unit")
-        if systemd_unit and str(systemd_unit).lower() == str(unit.get("unit", "")).lower():
+        if systemd_unit and str(systemd_unit).lower() == unit_name:
             return service_name
-    for service_name in sorted(
-        set(IMPORTANT_SERVICE_NAMES) | set(hints),
-        key=lambda name: (-len(name), name),
-    ):
-        if service_name.lower() in haystack:
+    # The fallback is exact unit-stem equality only; substring matching over
+    # the unit name and description reported prometheus-node-exporter.service
+    # as service "prometheus". A service running under any other unit name
+    # must declare an explicit `systemd_unit` probe hint.
+    stem = unit_name.removesuffix(".service")
+    for service_name in sorted(set(IMPORTANT_SERVICE_NAMES) | set(hints)):
+        if service_name.lower() == stem:
             return service_name
     return None
 
@@ -982,24 +984,38 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
     """
     summary: dict[str, Any] = {"available": False, "important_services": [], "updated_at": collected_at}
     hints = service_probe_hints(config)
-    if not {"node-agent", "ollama"} & set(hints):
+    # A hint may declare `process` (exact executable name, pgrep -x) or
+    # `process_pattern` (full-command-line match, pgrep -f) so a service
+    # running as a plain user process — neither systemd nor docker — is
+    # still observable. Only hinted services are probed: do not scan
+    # arbitrary processes on every host. Ollama keeps its implicit
+    # `process: ollama` default because desktop starts drop the launchd label.
+    process_probes: dict[str, list[str]] = {}
+    for service_name, hint in sorted(hints.items()):
+        process_pattern = hint.get("process_pattern")
+        process = hint.get("process")
+        if process_pattern:
+            process_probes[service_name] = ["pgrep", "-f", str(process_pattern)]
+        elif process:
+            process_probes[service_name] = ["pgrep", "-x", str(process)]
+        elif service_name == "ollama":
+            process_probes[service_name] = ["pgrep", "-x", "ollama"]
+    if not process_probes and not {"node-agent", "ollama"} & set(hints):
         return summary
 
     version = _node_agent_version()
-    if platform.system() == "Linux" and shutil.which("systemctl"):
+    if platform.system() == "Linux" and shutil.which("systemctl") and "node-agent" in hints:
         output = run_command(
             ["systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"], timeout=5
         )
-        if output is None:
-            return summary
-        summary["available"] = True
-        for unit in parse_systemd_units(output):
-            if unit.get("unit") != "opencode-agent.service":
-                continue
-            summary["important_services"].append(
-                {"service": "node-agent", "unit": unit.get("unit"), "state": "active" if unit.get("active") == "active" else unit.get("active"), "sub_state": unit.get("sub"), "version": version}
-            )
-        return summary
+        if output is not None:
+            summary["available"] = True
+            for unit in parse_systemd_units(output):
+                if unit.get("unit") != "opencode-agent.service":
+                    continue
+                summary["important_services"].append(
+                    {"service": "node-agent", "unit": unit.get("unit"), "state": "active" if unit.get("active") == "active" else unit.get("active"), "sub_state": unit.get("sub"), "version": version}
+                )
 
     if platform.system() == "Darwin" and shutil.which("launchctl"):
         # A plist retained on disk but not loaded is an installed stopped
@@ -1023,15 +1039,14 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
                 entry["version"] = service_version
             summary["important_services"].append(entry)
 
-    # Ollama can also be started directly by a developer or desktop app
-    # without retaining the expected launchd label. The desired probe hint
-    # keeps this narrow: do not scan arbitrary processes on every host.
-    if "ollama" in hints and not any(item.get("service") == "ollama" for item in summary["important_services"]):
-        output = run_command(["pgrep", "-x", "ollama"], timeout=5)
+    for service_name, command in process_probes.items():
+        if any(item.get("service") == service_name for item in summary["important_services"]):
+            continue
+        output = run_command(command, timeout=5)
         if output:
             summary["available"] = True
             summary["important_services"].append(
-                {"service": "ollama", "process": "ollama", "state": "active"}
+                {"service": service_name, "process": command[-1], "state": "active"}
             )
     return summary
 

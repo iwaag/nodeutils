@@ -112,6 +112,34 @@ class InventoryReportTests(unittest.TestCase):
             "prometheus-node-exporter",
         )
 
+    def test_systemd_fallback_requires_exact_unit_stem_not_substring(self) -> None:
+        self.assertIsNone(
+            nodeutils_collect.important_service_name_from_systemd(
+                {"unit": "prometheus-node-exporter.service", "description": "Prometheus Node Exporter"},
+                {},
+            )
+        )
+        self.assertIsNone(
+            nodeutils_collect.important_service_name_from_systemd(
+                {"unit": "cron.service", "description": "Runs the prometheus backup job"},
+                {},
+            )
+        )
+        self.assertEqual(
+            nodeutils_collect.important_service_name_from_systemd(
+                {"unit": "prometheus.service", "description": "Monitoring system"},
+                {},
+            ),
+            "prometheus",
+        )
+        self.assertEqual(
+            nodeutils_collect.important_service_name_from_systemd(
+                {"unit": "Nautobot.service", "description": ""},
+                {},
+            ),
+            "nautobot",
+        )
+
     def test_node_agent_linux_user_unit_reports_active_and_inactive_states(self) -> None:
         config = {"service_probe_hints": {"node-agent": {}}}
         unit_output = "opencode-agent.service loaded inactive dead OpenCode node agent\n"
@@ -161,6 +189,44 @@ class InventoryReportTests(unittest.TestCase):
             {"service": "ollama", "process": "ollama", "state": "active"}
         ])
         self.assertEqual(command.call_args.args[0], ["pgrep", "-x", "ollama"])
+
+    def test_hinted_plain_user_process_is_observed_on_linux(self) -> None:
+        config = {
+            "service_probe_hints": {
+                "swarmui": {"process_pattern": "StabilityMatrix.*SwarmUI"},
+                "comfyui": {"process": "comfyui"},
+            }
+        }
+
+        with (
+            mock.patch.object(nodeutils_collect.platform, "system", return_value="Linux"),
+            mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/systemctl"),
+            mock.patch.object(nodeutils_collect, "_node_agent_version", return_value=None),
+            mock.patch.object(nodeutils_collect, "run_command", side_effect=["4242\n", None]) as command,
+        ):
+            summary = nodeutils_collect.get_user_service_summary(config, "2026-08-06T00:00:00+00:00")
+
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["important_services"], [
+            {"service": "comfyui", "process": "comfyui", "state": "active"}
+        ])
+        self.assertEqual(
+            [call.args[0] for call in command.call_args_list],
+            [["pgrep", "-x", "comfyui"], ["pgrep", "-f", "StabilityMatrix.*SwarmUI"]],
+        )
+
+    def test_unhinted_services_probe_no_processes(self) -> None:
+        with (
+            mock.patch.object(nodeutils_collect.platform, "system", return_value="Linux"),
+            mock.patch.object(nodeutils_collect, "run_command") as command,
+        ):
+            summary = nodeutils_collect.get_user_service_summary(
+                {"service_probe_hints": {"grafana": {}}}, "2026-08-06T00:00:00+00:00"
+            )
+
+        self.assertFalse(summary["available"])
+        self.assertEqual(summary["important_services"], [])
+        command.assert_not_called()
 
     def test_node_agent_user_service_is_normalized_without_configuration_contents(self) -> None:
         observed = nodeutils_collect.normalize_observed_services(
