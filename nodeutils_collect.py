@@ -100,6 +100,51 @@ def run_command(command: list[str], timeout: int = 8) -> str | None:
     return completed.stdout.strip()
 
 
+# Executor-side copy of the state-proof check kinds (nctl's
+# `reconcile.profiles.EXISTENCE_PROOF_CHECK_KINDS`): a failed result of any
+# of these creates/keeps the observed entry with `state: missing`.
+EXISTENCE_PROOF_CHECK_KINDS = ("file_exists", "cron_registered")
+
+
+def crontab_registration_status(expanded_path: str, raw_path: str | None = None) -> str:
+    """Prove whether the login user's crontab references a script path.
+
+    Registration proof only -- never whether the task recently ran. A line
+    counts if it is not a comment and contains the resolved path (or the
+    original `~`-relative spelling, which POSIX sh tilde-expands when cron
+    runs the line). Exit status from `crontab -l` distinguishes an empty
+    crontab (`no crontab for <user>` -> `missing`) from an unusable crontab
+    tool (`error`) so an execution failure can never read as proof either way.
+    """
+
+    if shutil.which("crontab") is None:
+        return "error"
+    try:
+        completed = subprocess.run(
+            ["crontab", "-l"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "error"
+    if completed.returncode != 0:
+        if "no crontab" in (completed.stderr or "").lower():
+            return "missing"
+        return "error"
+    needles = [expanded_path]
+    if raw_path and raw_path != expanded_path:
+        needles.append(raw_path)
+    for line in completed.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if any(needle in stripped for needle in needles):
+            return "present"
+    return "missing"
+
+
 def read_text(path: str) -> str | None:
     try:
         text = Path(path).read_text(encoding="utf-8").strip()
@@ -1384,18 +1429,20 @@ def normalize_observed_services(
     # the rendered probe hints and are executed generically -- nodeutils knows
     # check *kinds*, never service names. `file_exists` proves on-disk
     # presence (a provider may be a desktop app or a plain script with no
-    # container or unit); `http` probes the placement's declared endpoint,
-    # and a successful local API probe remains valid actual-service evidence
+    # container or unit); `cron_registered` (autotask_intent ex1) proves the
+    # login user's crontab references the script -- registration, never
+    # activity; `http` probes the placement's declared endpoint, and a
+    # successful local API probe remains valid actual-service evidence
     # that also verifies client reachability. An `http` result overrides a
     # weaker docker/systemd state exactly as the old name-keyed probe did; a
-    # `file_exists` result never downgrades richer running-state evidence --
+    # state-proof result never downgrades richer running-state evidence --
     # its outcome is carried in the `checks` list for drift to evaluate.
     for service_name, hint in service_probe_hints(config).items():
         checks = hint.get("checks")
         if not isinstance(checks, list) or not checks:
             continue
         check_results: list[dict[str, Any]] = []
-        missing_file = False
+        proof_failed = False
         http_status: int | None = None
         for check in checks:
             if not isinstance(check, dict):
@@ -1407,10 +1454,18 @@ def normalize_observed_services(
                     continue
                 expanded = os.path.expanduser(path)
                 present = os.path.exists(expanded)
-                missing_file = missing_file or not present
+                proof_failed = proof_failed or not present
                 check_results.append(
                     {"kind": "file_exists", "path": expanded, "status": "present" if present else "missing"}
                 )
+            elif kind == "cron_registered":
+                path = check.get("path")
+                if not isinstance(path, str) or not path:
+                    continue
+                expanded = os.path.expanduser(path)
+                status = crontab_registration_status(expanded, raw_path=path)
+                proof_failed = proof_failed or status != "present"
+                check_results.append({"kind": "cron_registered", "path": expanded, "status": status})
             elif kind == "http":
                 endpoint = hint.get("endpoint")
                 paths = check.get("paths")
@@ -1433,13 +1488,16 @@ def normalize_observed_services(
                 "checked_at": collected_at,
             }
         elif existing is None:
-            if not any(result["kind"] == "file_exists" for result in check_results):
+            proof_kinds = sorted(
+                {result["kind"] for result in check_results if result["kind"] in EXISTENCE_PROOF_CHECK_KINDS}
+            )
+            if not proof_kinds:
                 # Only unanswered http probes: no fresh evidence either way,
                 # same as the old name-keyed probe's silent no-entry result.
                 continue
             entry = {
-                "state": "missing" if missing_file else "present",
-                "source": "check:file_exists",
+                "state": "missing" if proof_failed else "present",
+                "source": "check:" + "+".join(proof_kinds),
                 "checked_at": collected_at,
             }
         else:

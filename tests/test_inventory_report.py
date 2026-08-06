@@ -340,6 +340,143 @@ class InventoryReportTests(unittest.TestCase):
             [{"kind": "file_exists", "path": tmpdir, "status": "present"}],
         )
 
+    def test_cron_registered_check_reports_present_and_missing_states(self) -> None:
+        # autotask_intent ex1: registration proof joins existence proof. A
+        # registered crontab line yields present; with the script on disk but
+        # no crontab entry the placement state must be missing -- existence
+        # alone no longer reads as converged.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = str(Path(tmpdir) / "heartbeat.sh")
+            Path(script).write_text("#!/bin/sh\n")
+            hints = {
+                "service_probe_hints": {
+                    "heartbeat-cron": {
+                        "checks": [
+                            {"kind": "file_exists", "path": script},
+                            {"kind": "cron_registered", "path": script},
+                        ]
+                    }
+                }
+            }
+            with mock.patch.object(
+                nodeutils_collect, "crontab_registration_status", return_value="present"
+            ) as status:
+                observed = nodeutils_collect.normalize_observed_services(
+                    hints, {}, {}, "2026-08-07T00:00:00+00:00", None,
+                )
+            status.assert_called_once_with(script, raw_path=script)
+            self.assertEqual(observed["heartbeat-cron"]["state"], "present")
+            self.assertEqual(observed["heartbeat-cron"]["source"], "check:cron_registered+file_exists")
+            self.assertEqual(
+                observed["heartbeat-cron"]["checks"],
+                [
+                    {"kind": "file_exists", "path": script, "status": "present"},
+                    {"kind": "cron_registered", "path": script, "status": "present"},
+                ],
+            )
+
+            with mock.patch.object(
+                nodeutils_collect, "crontab_registration_status", return_value="missing"
+            ):
+                observed = nodeutils_collect.normalize_observed_services(
+                    hints, {}, {}, "2026-08-07T00:00:00+00:00", None,
+                )
+            self.assertEqual(observed["heartbeat-cron"]["state"], "missing")
+            self.assertEqual(observed["heartbeat-cron"]["checks"][1]["status"], "missing")
+
+    def test_cron_registered_check_expands_home_and_keeps_raw_needle(self) -> None:
+        with mock.patch.object(
+            nodeutils_collect, "crontab_registration_status", return_value="present"
+        ) as status:
+            observed = nodeutils_collect.normalize_observed_services(
+                {
+                    "service_probe_hints": {
+                        "heartbeat-cron": {
+                            "checks": [{"kind": "cron_registered", "path": "~/mycron/heartbeat.sh"}]
+                        }
+                    }
+                },
+                {}, {}, "2026-08-07T00:00:00+00:00", None,
+            )
+
+        expanded = str(Path("~/mycron/heartbeat.sh").expanduser())
+        status.assert_called_once_with(expanded, raw_path="~/mycron/heartbeat.sh")
+        self.assertEqual(observed["heartbeat-cron"]["checks"][0]["path"], expanded)
+
+    def test_crontab_registration_status_matches_expanded_and_raw_spellings(self) -> None:
+        crontab = (
+            "# m h dom mon dow command\n"
+            "*/10 * * * * ~/mycron/heartbeat.sh >> ~/mycron/heartbeat.log 2>&1\n"
+        )
+        completed = subprocess.CompletedProcess(["crontab", "-l"], 0, stdout=crontab, stderr="")
+        with mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/crontab"), \
+                mock.patch.object(nodeutils_collect.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                nodeutils_collect.crontab_registration_status(
+                    "/Users/eiji/mycron/heartbeat.sh", raw_path="~/mycron/heartbeat.sh"
+                ),
+                "present",
+            )
+            # A commented-out line is not a registration.
+            self.assertEqual(
+                nodeutils_collect.crontab_registration_status("/elsewhere/heartbeat.sh"),
+                "missing",
+            )
+
+        commented = subprocess.CompletedProcess(
+            ["crontab", "-l"], 0, stdout="# */10 * * * * /Users/eiji/mycron/heartbeat.sh\n", stderr=""
+        )
+        with mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/crontab"), \
+                mock.patch.object(nodeutils_collect.subprocess, "run", return_value=commented):
+            self.assertEqual(
+                nodeutils_collect.crontab_registration_status("/Users/eiji/mycron/heartbeat.sh"),
+                "missing",
+            )
+
+    def test_crontab_registration_status_fails_truthfully(self) -> None:
+        # Empty crontab ("no crontab for user", exit 1) is proof of absence;
+        # an unusable crontab tool is an error, never proof either way.
+        no_crontab = subprocess.CompletedProcess(["crontab", "-l"], 1, stdout="", stderr="no crontab for eiji")
+        with mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/crontab"), \
+                mock.patch.object(nodeutils_collect.subprocess, "run", return_value=no_crontab):
+            self.assertEqual(nodeutils_collect.crontab_registration_status("/x/y.sh"), "missing")
+
+        denied = subprocess.CompletedProcess(["crontab", "-l"], 1, stdout="", stderr="permission denied")
+        with mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/crontab"), \
+                mock.patch.object(nodeutils_collect.subprocess, "run", return_value=denied):
+            self.assertEqual(nodeutils_collect.crontab_registration_status("/x/y.sh"), "error")
+
+        with mock.patch.object(nodeutils_collect.shutil, "which", return_value=None):
+            self.assertEqual(nodeutils_collect.crontab_registration_status("/x/y.sh"), "error")
+
+        with mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/crontab"), \
+                mock.patch.object(
+                    nodeutils_collect.subprocess, "run",
+                    side_effect=subprocess.TimeoutExpired(["crontab", "-l"], 8),
+                ):
+            self.assertEqual(nodeutils_collect.crontab_registration_status("/x/y.sh"), "error")
+
+    def test_cron_registered_check_does_not_override_running_detection(self) -> None:
+        with mock.patch.object(
+            nodeutils_collect, "crontab_registration_status", return_value="missing"
+        ):
+            observed = nodeutils_collect.normalize_observed_services(
+                {
+                    "service_probe_hints": {
+                        "heartbeat-cron": {"checks": [{"kind": "cron_registered", "path": "/x/y.sh"}]}
+                    }
+                },
+                {}, {}, "2026-08-07T00:00:00+00:00", None,
+                {"important_services": [{"service": "heartbeat-cron", "process": "heartbeat", "state": "active"}]},
+            )
+
+        self.assertEqual(observed["heartbeat-cron"]["state"], "active")
+        self.assertEqual(observed["heartbeat-cron"]["source"], "process")
+        self.assertEqual(
+            observed["heartbeat-cron"]["checks"],
+            [{"kind": "cron_registered", "path": "/x/y.sh", "status": "missing"}],
+        )
+
     def test_unanswered_http_check_leaves_no_entry(self) -> None:
         with mock.patch.object(
             nodeutils_collect, "probe_http_paths", return_value=None
