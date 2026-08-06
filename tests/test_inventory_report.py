@@ -284,6 +284,35 @@ class InventoryReportTests(unittest.TestCase):
             ],
         )
 
+    def test_install_path_hint_registers_installed_service_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            observed = nodeutils_collect.normalize_observed_services(
+                {
+                    "service_probe_hints": {
+                        "swarmui": {"install_path": tmpdir},
+                        "comfyui": {"install_path": str(Path(tmpdir) / "does-not-exist")},
+                    }
+                },
+                {}, {}, "2026-08-06T00:00:00+00:00", None,
+            )
+
+        self.assertEqual(observed["swarmui"]["state"], "installed")
+        self.assertEqual(observed["swarmui"]["source"], "install_path")
+        self.assertEqual(observed["swarmui"]["install_path"], tmpdir)
+        self.assertNotIn("comfyui", observed)
+
+    def test_install_path_hint_does_not_override_running_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            observed = nodeutils_collect.normalize_observed_services(
+                {"service_probe_hints": {"swarmui": {"install_path": tmpdir}}},
+                {}, {}, "2026-08-06T00:00:00+00:00", None,
+                {"important_services": [{"service": "swarmui", "process": "StabilityMatrix.*SwarmUI", "state": "active"}]},
+            )
+
+        self.assertEqual(observed["swarmui"]["state"], "active")
+        self.assertEqual(observed["swarmui"]["source"], "process")
+        self.assertEqual(observed["swarmui"]["install_path"], tmpdir)
+
     def test_unregistered_service_endpoint_is_not_probed(self) -> None:
         with mock.patch.object(service_endpoint_probes.urllib.request, "urlopen") as urlopen:
             status = service_endpoint_probes.probe_service_endpoint("unknown-service", "http://127.0.0.1:9999")

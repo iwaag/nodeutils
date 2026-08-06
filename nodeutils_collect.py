@@ -1428,6 +1428,30 @@ def normalize_observed_services(
         existing = observed.get(service_name, {"source": "probe"})
         observed[service_name] = {**existing, "bindings": bindings}
 
+    # manual_service: an `install_path` hint marks a manually operated tool
+    # whose on-disk presence is itself the actual-state evidence (e.g.
+    # Stability Matrix packages that the user starts and stops at will).
+    # The entry is only created when no other detection produced one, so a
+    # running process/probe result keeps its richer state; when the path is
+    # absent no entry appears and drift reports service_missing.
+    for service_name, hint in service_probe_hints(config).items():
+        install_path = hint.get("install_path")
+        if not isinstance(install_path, str) or not install_path:
+            continue
+        expanded = os.path.expanduser(install_path)
+        if not os.path.exists(expanded):
+            continue
+        existing = observed.get(service_name)
+        if existing is None:
+            observed[service_name] = {
+                "state": "installed",
+                "source": "install_path",
+                "install_path": expanded,
+                "checked_at": collected_at,
+            }
+        else:
+            existing.setdefault("install_path", expanded)
+
     # Host tools and Docker images probing for non-daemon runtimes (e.g. blender, vdbmat-openvdb-cycles)
     for tool_name, possible_paths in [("blender", ["/snap/bin/blender", "/usr/bin/blender"])]:
         if tool_name not in observed:
