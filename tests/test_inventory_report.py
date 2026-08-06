@@ -238,24 +238,9 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(observed["node-agent"]["state"], "active")
         self.assertEqual(observed["node-agent"]["version"], "1.18.10")
 
-    def test_ollama_endpoint_probe_registers_active_service(self) -> None:
-        response = mock.MagicMock()
-        response.status = 200
-        response.__enter__.return_value = response
-        with mock.patch.object(
-            service_endpoint_probes.urllib.request, "urlopen", return_value=response
-        ) as urlopen:
-            observed = nodeutils_collect.normalize_observed_services(
-                {"service_probe_hints": {"ollama": {"endpoint": "http://agstudio.home.arpa:11434"}}},
-                {}, {}, "2026-07-31T00:00:00+00:00", None,
-            )
-
-        self.assertEqual(observed["ollama"]["state"], "active")
-        self.assertEqual(observed["ollama"]["source"], "http_probe")
-        self.assertEqual(observed["ollama"]["endpoint"], "http://agstudio.home.arpa:11434")
-        urlopen.assert_called_once_with("http://agstudio.home.arpa:11434/v1/models", timeout=3)
-
-    def test_swarmui_and_comfyui_endpoint_probes_register_active_service(self) -> None:
+    def test_hinted_http_check_registers_active_service(self) -> None:
+        # autotask_intent Step 2: the probe paths come from the rendered
+        # `checks` hint, not from any service-name-keyed table.
         response = mock.MagicMock()
         response.status = 200
         response.__enter__.return_value = response
@@ -265,8 +250,36 @@ class InventoryReportTests(unittest.TestCase):
             observed = nodeutils_collect.normalize_observed_services(
                 {
                     "service_probe_hints": {
-                        "swarmui": {"endpoint": "http://agpc.local:7801"},
-                        "comfyui": {"endpoint": "http://127.0.0.1:7821"},
+                        "ollama": {
+                            "endpoint": "http://agstudio.home.arpa:11434",
+                            "checks": [{"kind": "http", "paths": ["/v1/models", "/api/tags"]}],
+                        }
+                    }
+                },
+                {}, {}, "2026-07-31T00:00:00+00:00", None,
+            )
+
+        self.assertEqual(observed["ollama"]["state"], "active")
+        self.assertEqual(observed["ollama"]["source"], "http_probe")
+        self.assertEqual(observed["ollama"]["endpoint"], "http://agstudio.home.arpa:11434")
+        self.assertEqual(
+            observed["ollama"]["checks"],
+            [{"kind": "http", "endpoint": "http://agstudio.home.arpa:11434", "status": 200}],
+        )
+        urlopen.assert_called_once_with("http://agstudio.home.arpa:11434/v1/models", timeout=3)
+
+    def test_hinted_http_checks_probe_each_service_independently(self) -> None:
+        response = mock.MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        with mock.patch.object(
+            service_endpoint_probes.urllib.request, "urlopen", return_value=response
+        ) as urlopen:
+            observed = nodeutils_collect.normalize_observed_services(
+                {
+                    "service_probe_hints": {
+                        "swarmui": {"endpoint": "http://agpc.local:7801", "checks": [{"kind": "http", "paths": ["/"]}]},
+                        "comfyui": {"endpoint": "http://127.0.0.1:7821", "checks": [{"kind": "http", "paths": ["/"]}]},
                     }
                 },
                 {}, {}, "2026-08-02T00:00:00+00:00", None,
@@ -284,40 +297,72 @@ class InventoryReportTests(unittest.TestCase):
             ],
         )
 
-    def test_install_path_hint_registers_installed_service_when_present(self) -> None:
+    def test_file_exists_check_reports_present_and_missing_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             observed = nodeutils_collect.normalize_observed_services(
                 {
                     "service_probe_hints": {
-                        "swarmui": {"install_path": tmpdir},
-                        "comfyui": {"install_path": str(Path(tmpdir) / "does-not-exist")},
+                        "swarmui": {"checks": [{"kind": "file_exists", "path": tmpdir}]},
+                        "heartbeat-cron": {
+                            "checks": [{"kind": "file_exists", "path": str(Path(tmpdir) / "does-not-exist")}]
+                        },
                     }
                 },
                 {}, {}, "2026-08-06T00:00:00+00:00", None,
             )
 
-        self.assertEqual(observed["swarmui"]["state"], "installed")
-        self.assertEqual(observed["swarmui"]["source"], "install_path")
-        self.assertEqual(observed["swarmui"]["install_path"], tmpdir)
-        self.assertNotIn("comfyui", observed)
+        self.assertEqual(observed["swarmui"]["state"], "present")
+        self.assertEqual(observed["swarmui"]["source"], "check:file_exists")
+        self.assertEqual(
+            observed["swarmui"]["checks"],
+            [{"kind": "file_exists", "path": tmpdir, "status": "present"}],
+        )
+        # A missing file is positive evidence the check ran, not a silent
+        # no-entry: the entry exists with state=missing and the check result.
+        self.assertEqual(observed["heartbeat-cron"]["state"], "missing")
+        self.assertEqual(observed["heartbeat-cron"]["source"], "check:file_exists")
+        self.assertEqual(
+            observed["heartbeat-cron"]["checks"][0]["status"], "missing",
+        )
 
-    def test_install_path_hint_does_not_override_running_detection(self) -> None:
+    def test_file_exists_check_does_not_override_running_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             observed = nodeutils_collect.normalize_observed_services(
-                {"service_probe_hints": {"swarmui": {"install_path": tmpdir}}},
+                {"service_probe_hints": {"swarmui": {"checks": [{"kind": "file_exists", "path": tmpdir}]}}},
                 {}, {}, "2026-08-06T00:00:00+00:00", None,
                 {"important_services": [{"service": "swarmui", "process": "StabilityMatrix.*SwarmUI", "state": "active"}]},
             )
 
         self.assertEqual(observed["swarmui"]["state"], "active")
         self.assertEqual(observed["swarmui"]["source"], "process")
-        self.assertEqual(observed["swarmui"]["install_path"], tmpdir)
+        self.assertEqual(
+            observed["swarmui"]["checks"],
+            [{"kind": "file_exists", "path": tmpdir, "status": "present"}],
+        )
 
-    def test_unregistered_service_endpoint_is_not_probed(self) -> None:
+    def test_unanswered_http_check_leaves_no_entry(self) -> None:
+        with mock.patch.object(
+            nodeutils_collect, "probe_http_paths", return_value=None
+        ):
+            observed = nodeutils_collect.normalize_observed_services(
+                {
+                    "service_probe_hints": {
+                        "ollama": {"endpoint": "http://127.0.0.1:9999", "checks": [{"kind": "http", "paths": ["/"]}]}
+                    }
+                },
+                {}, {}, "2026-08-06T00:00:00+00:00", None,
+            )
+
+        self.assertNotIn("ollama", observed)
+
+    def test_http_check_without_endpoint_hint_is_skipped(self) -> None:
         with mock.patch.object(service_endpoint_probes.urllib.request, "urlopen") as urlopen:
-            status = service_endpoint_probes.probe_service_endpoint("unknown-service", "http://127.0.0.1:9999")
+            observed = nodeutils_collect.normalize_observed_services(
+                {"service_probe_hints": {"ollama": {"checks": [{"kind": "http", "paths": ["/"]}]}}},
+                {}, {}, "2026-08-06T00:00:00+00:00", None,
+            )
 
-        self.assertIsNone(status)
+        self.assertNotIn("ollama", observed)
         urlopen.assert_not_called()
 
 

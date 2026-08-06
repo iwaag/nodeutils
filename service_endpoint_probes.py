@@ -1,34 +1,21 @@
-"""Service-specific HTTP endpoint probe definitions and execution."""
+"""Generic bounded HTTP endpoint probing driven by rendered check hints.
+
+autotask_intent Step 2: the paths to probe come from the service's rendered
+`checks` hint (`kind: http`), owned by the deployment-profile layer in
+`ansible_agdev/vars/deployment_profiles.yml`. nodeutils no longer keys probe
+knowledge by service name.
+"""
 
 from __future__ import annotations
 
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
-class HttpProbeSpec:
-    """Closed HTTP probe definition for one supported service."""
+def probe_http_paths(endpoint: str, paths: list[str]) -> int | None:
+    """Return the first bounded HTTP status for `endpoint` across `paths`."""
 
-    paths: tuple[str, ...]
-
-
-HTTP_PROBE_SPECS: dict[str, HttpProbeSpec] = {
-    "ollama": HttpProbeSpec(paths=("/v1/models", "/api/tags")),
-    "swarmui": HttpProbeSpec(paths=("/",)),
-    "comfyui": HttpProbeSpec(paths=("/",)),
-}
-
-
-def probe_service_endpoint(service_name: str, endpoint: str) -> int | None:
-    """Return a bounded health status for a registered desired service API."""
-
-    spec = HTTP_PROBE_SPECS.get(service_name)
-    if spec is None:
-        return None
-
-    for path in spec.paths:
+    for path in paths:
         try:
             with urllib.request.urlopen(f"{endpoint.rstrip('/')}{path}", timeout=3) as response:
                 return int(response.status)

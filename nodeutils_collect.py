@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - depends on host environment
 
 import proxmox_inventory
 from proxmox_inventory import ProxmoxInventoryError
-from service_endpoint_probes import probe_service_endpoint
+from service_endpoint_probes import probe_http_paths
 
 # fix_sshkey3 Step 4: v1 -> v2 is a coordinated breaking change (new
 # observed_services[*].managed_files structure). No dual reader -- the nauto
@@ -1380,26 +1380,72 @@ def normalize_observed_services(
             "checked_at": collected_at,
         }
 
-    # A provider may be managed by a desktop application and therefore have
-    # neither a stable container nor a visible launchd/systemd unit. For the
-    # narrow set of desired service endpoints, a successful local API probe is
-    # valid actual-service evidence and also verifies client reachability.
+    # autotask_intent Step 2: profile-declared checks arrive fully resolved in
+    # the rendered probe hints and are executed generically -- nodeutils knows
+    # check *kinds*, never service names. `file_exists` proves on-disk
+    # presence (a provider may be a desktop app or a plain script with no
+    # container or unit); `http` probes the placement's declared endpoint,
+    # and a successful local API probe remains valid actual-service evidence
+    # that also verifies client reachability. An `http` result overrides a
+    # weaker docker/systemd state exactly as the old name-keyed probe did; a
+    # `file_exists` result never downgrades richer running-state evidence --
+    # its outcome is carried in the `checks` list for drift to evaluate.
     for service_name, hint in service_probe_hints(config).items():
-        endpoint = hint.get("endpoint")
-        if not isinstance(endpoint, str) or not endpoint:
+        checks = hint.get("checks")
+        if not isinstance(checks, list) or not checks:
             continue
-        status = probe_service_endpoint(service_name, endpoint)
-        if status is None:
+        check_results: list[dict[str, Any]] = []
+        missing_file = False
+        http_status: int | None = None
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            kind = check.get("kind")
+            if kind == "file_exists":
+                path = check.get("path")
+                if not isinstance(path, str) or not path:
+                    continue
+                expanded = os.path.expanduser(path)
+                present = os.path.exists(expanded)
+                missing_file = missing_file or not present
+                check_results.append(
+                    {"kind": "file_exists", "path": expanded, "status": "present" if present else "missing"}
+                )
+            elif kind == "http":
+                endpoint = hint.get("endpoint")
+                paths = check.get("paths")
+                if not isinstance(endpoint, str) or not endpoint or not isinstance(paths, list) or not paths:
+                    continue
+                status = probe_http_paths(endpoint, [str(item) for item in paths])
+                if status is not None and http_status is None:
+                    http_status = status
+                check_results.append({"kind": "http", "endpoint": endpoint, "status": status})
+        if not check_results:
             continue
-        existing = observed.get(service_name, {})
-        observed[service_name] = {
-            **existing,
-            "state": "active" if 200 <= status < 300 else "unreachable",
-            "source": "http_probe",
-            "endpoint": endpoint,
-            "http_status": status,
-            "checked_at": collected_at,
-        }
+        existing = observed.get(service_name)
+        if http_status is not None:
+            entry = {
+                **(existing or {}),
+                "state": "active" if 200 <= http_status < 300 else "unreachable",
+                "source": "http_probe",
+                "endpoint": hint.get("endpoint"),
+                "http_status": http_status,
+                "checked_at": collected_at,
+            }
+        elif existing is None:
+            if not any(result["kind"] == "file_exists" for result in check_results):
+                # Only unanswered http probes: no fresh evidence either way,
+                # same as the old name-keyed probe's silent no-entry result.
+                continue
+            entry = {
+                "state": "missing" if missing_file else "present",
+                "source": "check:file_exists",
+                "checked_at": collected_at,
+            }
+        else:
+            entry = existing
+        entry["checks"] = check_results
+        observed[service_name] = entry
 
     # fix_sshkey3 Step 4: a hinted managed-file observation is attached (and
     # the service entry created if docker/systemd never independently
@@ -1427,30 +1473,6 @@ def normalize_observed_services(
             continue
         existing = observed.get(service_name, {"source": "probe"})
         observed[service_name] = {**existing, "bindings": bindings}
-
-    # manual_service: an `install_path` hint marks a manually operated tool
-    # whose on-disk presence is itself the actual-state evidence (e.g.
-    # Stability Matrix packages that the user starts and stops at will).
-    # The entry is only created when no other detection produced one, so a
-    # running process/probe result keeps its richer state; when the path is
-    # absent no entry appears and drift reports service_missing.
-    for service_name, hint in service_probe_hints(config).items():
-        install_path = hint.get("install_path")
-        if not isinstance(install_path, str) or not install_path:
-            continue
-        expanded = os.path.expanduser(install_path)
-        if not os.path.exists(expanded):
-            continue
-        existing = observed.get(service_name)
-        if existing is None:
-            observed[service_name] = {
-                "state": "installed",
-                "source": "install_path",
-                "install_path": expanded,
-                "checked_at": collected_at,
-            }
-        else:
-            existing.setdefault("install_path", expanded)
 
     # Host tools and Docker images probing for non-daemon runtimes (e.g. blender, vdbmat-openvdb-cycles)
     for tool_name, possible_paths in [("blender", ["/snap/bin/blender", "/usr/bin/blender"])]:
