@@ -37,8 +37,11 @@ LIMIT_CONFIG_INTERFACES_PER_GUEST = 64
 LIMIT_AGENT_INTERFACES_PER_GUEST = 256
 LIMIT_ADDRESSES_PER_AGENT_INTERFACE = 64
 LIMIT_STORAGE_SCOPES = 128
-LIMIT_VZTMPL_ITEMS_PER_STORAGE = 2048
+LIMIT_CONTENT_ITEMS_PER_STORAGE = 2048
 LIMIT_ERRORS_PER_SCOPE = 128
+
+# Closed set of storage content types collected as template evidence.
+STORAGE_CONTENT_TYPES = ("vztmpl", "iso")
 
 DEFAULT_PROXMOX_CONFIG: dict[str, Any] = {
     "enabled": "auto",
@@ -704,62 +707,66 @@ def collect_proxmox_inventory(
             node_storages = []
         for storage in node_storages[:LIMIT_STORAGE_SCOPES]:
             storage_name = storage.get("storage")
-            content_types = str(storage.get("content", ""))
-            if not storage_name or "vztmpl" not in content_types:
+            advertised = {part.strip() for part in str(storage.get("content", "")).split(",")}
+            wanted_types = [ct for ct in STORAGE_CONTENT_TYPES if ct in advertised]
+            if not storage_name or not wanted_types:
                 continue
-            scope_id = f"{node}:{storage_name}:vztmpl"
             try:
                 raw_content = list_items(run_pvesh(f"/nodes/{node}/storage/{storage_name}/content"))
-                items = []
-                for entry in raw_content:
-                    if entry.get("content") != "vztmpl":
-                        continue
-                    volid = entry.get("volid")
-                    if not volid:
-                        continue
-                    items.append(
+                for content_type in wanted_types:
+                    scope_id = f"{node}:{storage_name}:{content_type}"
+                    items = []
+                    for entry in raw_content:
+                        if entry.get("content") != content_type:
+                            continue
+                        volid = entry.get("volid")
+                        if not volid:
+                            continue
+                        items.append(
+                            {
+                                "volid": volid,
+                                "content": content_type,
+                                "format": entry.get("format"),
+                                "size_bytes": entry.get("size"),
+                            }
+                        )
+                    items = sorted(items, key=lambda item: item["volid"])
+                    items_truncated = len(items) > LIMIT_CONTENT_ITEMS_PER_STORAGE
+                    if items_truncated:
+                        sink.add("storage", scope_id, "storage_inventory", "truncated_collection")
+                    items = items[:LIMIT_CONTENT_ITEMS_PER_STORAGE]
+                    storage_content.append(
                         {
-                            "volid": volid,
-                            "content": "vztmpl",
-                            "format": entry.get("format"),
-                            "size_bytes": entry.get("size"),
+                            "node": node,
+                            "storage": storage_name,
+                            "content_type": content_type,
+                            "state": "partial" if items_truncated else "complete",
+                            "last_attempted_at": collected_at,
+                            "evidence_observed_at": collected_at,
+                            "omitted_error_count": 0,
+                            "errors": [],
+                            "items": items,
                         }
                     )
-                items = sorted(items, key=lambda item: item["volid"])
-                items_truncated = len(items) > LIMIT_VZTMPL_ITEMS_PER_STORAGE
-                if items_truncated:
-                    sink.add("storage", scope_id, "storage_inventory", "truncated_collection")
-                items = items[:LIMIT_VZTMPL_ITEMS_PER_STORAGE]
-                storage_content.append(
-                    {
-                        "node": node,
-                        "storage": storage_name,
-                        "content_type": "vztmpl",
-                        "state": "partial" if items_truncated else "complete",
-                        "last_attempted_at": collected_at,
-                        "evidence_observed_at": collected_at,
-                        "omitted_error_count": 0,
-                        "errors": [],
-                        "items": items,
-                    }
-                )
                 storage_sections.append(
                     {"node": node, "storage": storage_name, "state": "complete", "evidence_observed_at": collected_at}
                 )
             except ProxmoxInventoryError:
-                storage_content.append(
-                    {
-                        "node": node,
-                        "storage": storage_name,
-                        "content_type": "vztmpl",
-                        "state": "partial",
-                        "last_attempted_at": collected_at,
-                        "evidence_observed_at": None,
-                        "omitted_error_count": 0,
-                        "errors": [_make_error("storage", scope_id, "storage_inventory", "storage_content_failed")],
-                        "items": [],
-                    }
-                )
+                for content_type in wanted_types:
+                    scope_id = f"{node}:{storage_name}:{content_type}"
+                    storage_content.append(
+                        {
+                            "node": node,
+                            "storage": storage_name,
+                            "content_type": content_type,
+                            "state": "partial",
+                            "last_attempted_at": collected_at,
+                            "evidence_observed_at": None,
+                            "omitted_error_count": 0,
+                            "errors": [_make_error("storage", scope_id, "storage_inventory", "storage_content_failed")],
+                            "items": [],
+                        }
+                    )
                 storage_sections.append({"node": node, "storage": storage_name, "state": "partial", "evidence_observed_at": None})
                 platform_partial = True
 

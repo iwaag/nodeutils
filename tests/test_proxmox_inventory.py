@@ -423,7 +423,9 @@ class CollectProxmoxInventoryFixtureTests(unittest.TestCase):
             },
             "/nodes/aghub/storage": [{"storage": "local", "content": "iso,vztmpl,backup"}],
             "/nodes/aghub/storage/local/content": [
-                {"volid": "local:vztmpl/debian-13-standard.tar.zst", "content": "vztmpl", "format": "tzst", "size": 123}
+                {"volid": "local:vztmpl/debian-13-standard.tar.zst", "content": "vztmpl", "format": "tzst", "size": 123},
+                {"volid": "local:iso/ubuntu-24.04.2-live-server-amd64.iso", "content": "iso", "format": "iso", "size": 456},
+                {"volid": "local:backup/vzdump-lxc-108.tar.zst", "content": "backup", "format": "tar.zst", "size": 789},
             ],
         }
         if path not in responses:
@@ -458,9 +460,73 @@ class CollectProxmoxInventoryFixtureTests(unittest.TestCase):
         self.assertIn(102, qemu_by_vmid)
         self.assertEqual(qemu_by_vmid[102]["name"], "aghaos")
 
-        storage_scope = facts["storage_content"][0]
-        self.assertEqual(storage_scope["state"], "complete")
-        self.assertEqual(storage_scope["items"][0]["volid"], "local:vztmpl/debian-13-standard.tar.zst")
+        scopes = {(s["storage"], s["content_type"]): s for s in facts["storage_content"]}
+        self.assertEqual(set(scopes), {("local", "vztmpl"), ("local", "iso")})
+        vztmpl_scope = scopes[("local", "vztmpl")]
+        self.assertEqual(vztmpl_scope["state"], "complete")
+        self.assertEqual(vztmpl_scope["items"][0]["volid"], "local:vztmpl/debian-13-standard.tar.zst")
+        iso_scope = scopes[("local", "iso")]
+        self.assertEqual(iso_scope["state"], "complete")
+        self.assertEqual(
+            [item["volid"] for item in iso_scope["items"]],
+            ["local:iso/ubuntu-24.04.2-live-server-amd64.iso"],
+        )
+        self.assertEqual(iso_scope["items"][0]["content"], "iso")
+
+    def test_iso_scope_items_sorted_and_truncated(self) -> None:
+        many = [
+            {"volid": f"local:iso/img-{i:04d}.iso", "content": "iso", "format": "iso", "size": 1}
+            for i in range(proxmox_inventory.LIMIT_CONTENT_ITEMS_PER_STORAGE + 1)
+        ]
+
+        def side_effect(path: str, timeout: int = 15):
+            if path == "/nodes/aghub/storage/local/content":
+                return list(reversed(many))
+            return self._pvesh_side_effect(path, timeout)
+
+        with (
+            mock.patch.object(proxmox_inventory, "is_proxmox_host", return_value=True),
+            mock.patch.object(proxmox_inventory.shutil, "which", return_value="/usr/bin/pvesh"),
+            mock.patch.object(proxmox_inventory, "run_pvesh", side_effect=side_effect),
+            mock.patch.object(proxmox_inventory, "collect_guest_agent_interfaces", return_value=([], True)),
+        ):
+            facts = proxmox_inventory.collect_proxmox_inventory(
+                {}, {"short_hostname": "aghub", "collected_at": COLLECTED_AT}
+            )
+
+        scopes = {(s["storage"], s["content_type"]): s for s in facts["storage_content"]}
+        iso_scope = scopes[("local", "iso")]
+        self.assertEqual(iso_scope["state"], "partial")
+        self.assertEqual(len(iso_scope["items"]), proxmox_inventory.LIMIT_CONTENT_ITEMS_PER_STORAGE)
+        volids = [item["volid"] for item in iso_scope["items"]]
+        self.assertEqual(volids, sorted(volids))
+        # the empty vztmpl scope from the same storage stays complete and isolated
+        self.assertEqual(scopes[("local", "vztmpl")]["state"], "complete")
+        self.assertEqual(scopes[("local", "vztmpl")]["items"], [])
+
+    def test_failed_storage_listing_yields_partial_scope_per_wanted_type(self) -> None:
+        def side_effect(path: str, timeout: int = 15):
+            if path == "/nodes/aghub/storage/local/content":
+                raise proxmox_inventory.ProxmoxInventoryError("boom")
+            return self._pvesh_side_effect(path, timeout)
+
+        with (
+            mock.patch.object(proxmox_inventory, "is_proxmox_host", return_value=True),
+            mock.patch.object(proxmox_inventory.shutil, "which", return_value="/usr/bin/pvesh"),
+            mock.patch.object(proxmox_inventory, "run_pvesh", side_effect=side_effect),
+            mock.patch.object(proxmox_inventory, "collect_guest_agent_interfaces", return_value=([], True)),
+        ):
+            facts = proxmox_inventory.collect_proxmox_inventory(
+                {}, {"short_hostname": "aghub", "collected_at": COLLECTED_AT}
+            )
+
+        self.assertEqual(facts["collection"]["state"], "partial")
+        scopes = {(s["storage"], s["content_type"]): s for s in facts["storage_content"]}
+        self.assertEqual(set(scopes), {("local", "vztmpl"), ("local", "iso")})
+        for scope in scopes.values():
+            self.assertEqual(scope["state"], "partial")
+            self.assertEqual(scope["items"], [])
+            self.assertEqual(scope["errors"][0]["code"], "storage_content_failed")
 
     def test_one_malformed_guest_isolates_and_marks_platform_partial(self) -> None:
         def side_effect(path: str, timeout: int = 15):
