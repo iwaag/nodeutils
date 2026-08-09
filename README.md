@@ -181,6 +181,15 @@ Ubuntu cron example:
 
 Use an equivalent `launchd` schedule on macOS.
 
+## Design rule: keep service-specific observation knowledge out of collector orchestration
+
+Keep nodeutils collection flow generic and place service-specific probe paths or evaluation
+rules in a separate, closed registry/module. At the current scale a static registry is
+sufficient; do not add dynamic plugin loading preemptively. If the service catalog grows, move
+probe specifications into validated deployment profile observation metadata, have nctl render
+them into probe hints, and keep nodeutils responsible only for bounded execution and common
+result normalization.
+
 ## Tests
 
 Run the ordinary suite with `uv run pytest -q --durations=20`. The repository
