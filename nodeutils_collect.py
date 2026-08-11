@@ -787,6 +787,11 @@ def normalize_docker_ports(raw_ports: Any) -> list[str]:
 def important_service_name(container: dict[str, Any], config: dict[str, Any] | None = None) -> str | None:
     config = config or {}
     labels = container.get("labels") if isinstance(container.get("labels"), dict) else {}
+    candidates = set(IMPORTANT_SERVICE_NAMES) | set(service_probe_hints(config))
+    compose_service = str(labels.get("com.docker.compose.service") or "").lower()
+    for service_name in sorted(candidates):
+        if service_name.lower() == compose_service:
+            return service_name
     haystack = " ".join(
         str(value or "").lower()
         for value in (
@@ -797,7 +802,7 @@ def important_service_name(container: dict[str, Any], config: dict[str, Any] | N
         )
     )
     for service_name in sorted(
-        set(IMPORTANT_SERVICE_NAMES) | set(service_probe_hints(config)),
+        candidates,
         key=lambda name: (-len(name), name),
     ):
         if service_name in haystack:

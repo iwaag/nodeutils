@@ -89,6 +89,21 @@ class InventoryReportTests(unittest.TestCase):
             "dnsmasq",
         )
 
+    def test_docker_compose_service_wins_over_container_name_substrings(self) -> None:
+        container = {
+            "name": "nautobot-redis",
+            "image": "redis:7",
+            "labels": {"com.docker.compose.service": "redis"},
+        }
+
+        self.assertEqual(
+            nodeutils_collect.important_service_name(
+                container,
+                {"service_probe_hints": {"nautobot": {}, "redis": {}}},
+            ),
+            "redis",
+        )
+
     def test_systemd_probe_hint_supports_nomad_and_node_exporter_units(self) -> None:
         config = {
             "service_probe_hints": {
