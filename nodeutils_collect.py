@@ -1018,16 +1018,10 @@ def get_systemd_summary(config: dict[str, Any], collected_at: str) -> dict[str, 
     return summary
 
 
-def _node_agent_version() -> str | None:
-    """Return the installed OpenCode version without exposing its configuration."""
-    executable = shutil.which("opencode") or str(Path.home() / ".local/bin/opencode")
-    return run_command([executable, "--version"], timeout=5) if Path(executable).exists() else None
-
-
 def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[str, Any]:
     """Observe declared user services, including inactive installed units.
 
-    Node agents deliberately run as the Ansible login user.  The ordinary
+    Some services deliberately run as the Ansible login user.  The ordinary
     system service listing cannot see either their Linux systemd --user unit
     or macOS LaunchAgent, so this is a separate, narrow probe rather than a
     change to the system-service contract.
@@ -1050,22 +1044,8 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
             process_probes[service_name] = ["pgrep", "-x", str(process)]
         elif service_name == "ollama":
             process_probes[service_name] = ["pgrep", "-x", "ollama"]
-    if not process_probes and not {"node-agent", "ollama"} & set(hints):
+    if not process_probes and "ollama" not in hints:
         return summary
-
-    version = _node_agent_version()
-    if platform.system() == "Linux" and shutil.which("systemctl") and "node-agent" in hints:
-        output = run_command(
-            ["systemctl", "--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"], timeout=5
-        )
-        if output is not None:
-            summary["available"] = True
-            for unit in parse_systemd_units(output):
-                if unit.get("unit") != "opencode-agent.service":
-                    continue
-                summary["important_services"].append(
-                    {"service": "node-agent", "unit": unit.get("unit"), "state": "active" if unit.get("active") == "active" else unit.get("active"), "sub_state": unit.get("sub"), "version": version}
-                )
 
     if platform.system() == "Darwin" and shutil.which("launchctl"):
         # A plist retained on disk but not loaded is an installed stopped
@@ -1073,8 +1053,6 @@ def get_user_service_summary(config: dict[str, Any], collected_at: str) -> dict[
         # indistinguishable from an absent service. Ollama.app registers the
         # documented launchd label without requiring a user-local plist.
         launch_agents = []
-        if "node-agent" in hints:
-            launch_agents.append(("node-agent", "com.clusterintent.opencode.agent", version, True))
         if "ollama" in hints:
             launch_agents.append(("ollama", "com.ollama.ollama", None, False))
         for service, label, service_version, has_local_plist in launch_agents:

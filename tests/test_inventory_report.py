@@ -155,30 +155,12 @@ class InventoryReportTests(unittest.TestCase):
             "nautobot",
         )
 
-    def test_node_agent_linux_user_unit_reports_active_and_inactive_states(self) -> None:
-        config = {"service_probe_hints": {"node-agent": {}}}
-        unit_output = "opencode-agent.service loaded inactive dead OpenCode node agent\n"
-
-        with (
-            mock.patch.object(nodeutils_collect.platform, "system", return_value="Linux"),
-            mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/systemctl"),
-            mock.patch.object(nodeutils_collect, "_node_agent_version", return_value="1.18.10"),
-            mock.patch.object(nodeutils_collect, "run_command", return_value=unit_output) as command,
-        ):
-            summary = nodeutils_collect.get_user_service_summary(config, "2026-07-31T00:00:00+00:00")
-
-        self.assertTrue(summary["available"])
-        self.assertEqual(summary["important_services"][0]["state"], "inactive")
-        self.assertEqual(summary["important_services"][0]["version"], "1.18.10")
-        self.assertEqual(command.call_args.args[0][:3], ["systemctl", "--user", "list-units"])
-
     def test_ollama_macos_launchd_service_is_observed_when_requested(self) -> None:
         config = {"service_probe_hints": {"ollama": {}}}
 
         with (
             mock.patch.object(nodeutils_collect.platform, "system", return_value="Darwin"),
             mock.patch.object(nodeutils_collect.shutil, "which", return_value="/bin/launchctl"),
-            mock.patch.object(nodeutils_collect, "_node_agent_version", return_value=None),
             mock.patch.object(nodeutils_collect, "run_command", return_value="123\t0\tcom.ollama.ollama") as command,
         ):
             summary = nodeutils_collect.get_user_service_summary(config, "2026-07-31T00:00:00+00:00")
@@ -195,7 +177,6 @@ class InventoryReportTests(unittest.TestCase):
         with (
             mock.patch.object(nodeutils_collect.platform, "system", return_value="Darwin"),
             mock.patch.object(nodeutils_collect.shutil, "which", return_value="/bin/launchctl"),
-            mock.patch.object(nodeutils_collect, "_node_agent_version", return_value=None),
             mock.patch.object(nodeutils_collect, "run_command", side_effect=[None, "123\n"]) as command,
         ):
             summary = nodeutils_collect.get_user_service_summary(config, "2026-07-31T00:00:00+00:00")
@@ -216,7 +197,6 @@ class InventoryReportTests(unittest.TestCase):
         with (
             mock.patch.object(nodeutils_collect.platform, "system", return_value="Linux"),
             mock.patch.object(nodeutils_collect.shutil, "which", return_value="/usr/bin/systemctl"),
-            mock.patch.object(nodeutils_collect, "_node_agent_version", return_value=None),
             mock.patch.object(nodeutils_collect, "run_command", side_effect=["4242\n", None]) as command,
         ):
             summary = nodeutils_collect.get_user_service_summary(config, "2026-08-06T00:00:00+00:00")
@@ -243,15 +223,15 @@ class InventoryReportTests(unittest.TestCase):
         self.assertEqual(summary["important_services"], [])
         command.assert_not_called()
 
-    def test_node_agent_user_service_is_normalized_without_configuration_contents(self) -> None:
+    def test_a_user_unit_service_is_normalized_without_configuration_contents(self) -> None:
         observed = nodeutils_collect.normalize_observed_services(
-            {"service_probe_hints": {"node-agent": {}}}, {}, {}, "2026-07-31T00:00:00+00:00", None,
-            {"important_services": [{"service": "node-agent", "unit": "opencode-agent.service", "state": "active", "version": "1.18.10"}]},
+            {"service_probe_hints": {"someagent": {}}}, {}, {}, "2026-07-31T00:00:00+00:00", None,
+            {"important_services": [{"service": "someagent", "unit": "someagent.service", "state": "active", "version": "1.2.3"}]},
         )
 
-        self.assertEqual(observed["node-agent"]["source"], "systemd_user")
-        self.assertEqual(observed["node-agent"]["state"], "active")
-        self.assertEqual(observed["node-agent"]["version"], "1.18.10")
+        self.assertEqual(observed["someagent"]["source"], "systemd_user")
+        self.assertEqual(observed["someagent"]["state"], "active")
+        self.assertEqual(observed["someagent"]["version"], "1.2.3")
 
     def test_hinted_http_check_registers_active_service(self) -> None:
         # autotask_intent Step 2: the probe paths come from the rendered
@@ -629,7 +609,7 @@ class InventoryReportTests(unittest.TestCase):
 
     def test_observe_binding_present_and_reachable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "opencode.json"
+            path = Path(tmpdir) / "agent-config.json"
             path.write_text(json.dumps({"provider": {"ollama": {"options": {"baseURL": "http://agstudio.home.arpa:11434/v1"}}}}))
             spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
 
@@ -648,7 +628,7 @@ class InventoryReportTests(unittest.TestCase):
 
     def test_observe_binding_unreachable_when_probe_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "opencode.json"
+            path = Path(tmpdir) / "agent-config.json"
             path.write_text(json.dumps({"provider": {"ollama": {"options": {"baseURL": "http://dead.example:11434/v1"}}}}))
             spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
 
@@ -660,7 +640,7 @@ class InventoryReportTests(unittest.TestCase):
             self.assertNotIn("http_status", entry)
 
     def test_observe_binding_absent_when_config_file_missing(self) -> None:
-        spec = {"config_file": "/nonexistent/opencode.json", "json_path": "provider.ollama.options.baseURL"}
+        spec = {"config_file": "/nonexistent/agent-config.json", "json_path": "provider.ollama.base_url"}
 
         entry = nodeutils_collect.observe_binding(spec, "2026-08-01T00:00:00+00:00")
 
@@ -669,7 +649,7 @@ class InventoryReportTests(unittest.TestCase):
 
     def test_observe_binding_absent_when_slot_missing_from_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "opencode.json"
+            path = Path(tmpdir) / "agent-config.json"
             path.write_text(json.dumps({"provider": {}}))
             spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
 
@@ -679,7 +659,7 @@ class InventoryReportTests(unittest.TestCase):
 
     def test_observe_binding_unreadable_when_json_is_malformed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "opencode.json"
+            path = Path(tmpdir) / "agent-config.json"
             path.write_text("{not valid json")
             spec = {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"}
 
@@ -689,20 +669,20 @@ class InventoryReportTests(unittest.TestCase):
 
     def test_observe_binding_expands_home_relative_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "opencode.json"
+            path = Path(tmpdir) / "agent-config.json"
             path.write_text(json.dumps({"a": {"b": "http://x:1/v1"}}))
             spec = {"config_file": str(path), "json_path": "a.b"}
 
             with mock.patch.object(Path, "expanduser", return_value=path):
                 with mock.patch.object(nodeutils_collect.urllib.request, "urlopen", side_effect=OSError()):
-                    entry = nodeutils_collect.observe_binding({"config_file": "~/opencode.json", "json_path": "a.b"}, "t")
+                    entry = nodeutils_collect.observe_binding({"config_file": "~/agent-config.json", "json_path": "a.b"}, "t")
 
             self.assertEqual(entry["configuration_status"], "present")
             self.assertEqual(entry["configured_endpoint"], "http://x:1/v1")
 
     def test_no_secret_value_survives_bounded_value_in_a_binding_observation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "opencode.json"
+            path = Path(tmpdir) / "agent-config.json"
             path.write_text(json.dumps({"a": {"b": "x" * 600}}))
             spec = {"config_file": str(path), "json_path": "a.b"}
 
@@ -712,19 +692,19 @@ class InventoryReportTests(unittest.TestCase):
             self.assertLessEqual(len(entry["configured_endpoint"]), nodeutils_collect.MAX_STRING_LENGTH + len("...[truncated]"))
 
     def test_bindings_for_service_rejects_malformed_spec(self) -> None:
-        config = {"service_probe_hints": {"node-agent": {"bindings": {"llm_provider": "not-a-mapping"}}}}
+        config = {"service_probe_hints": {"llm-consumer": {"bindings": {"llm_provider": "not-a-mapping"}}}}
 
-        results = nodeutils_collect.bindings_for_service("node-agent", config, "2026-08-01T00:00:00+00:00")
+        results = nodeutils_collect.bindings_for_service("llm-consumer", config, "2026-08-01T00:00:00+00:00")
 
         self.assertEqual(results, {})
 
     def test_normalize_observed_services_attaches_bindings_without_docker_or_systemd_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "opencode.json"
+            path = Path(tmpdir) / "agent-config.json"
             path.write_text(json.dumps({"provider": {"ollama": {"options": {"baseURL": "http://agstudio.home.arpa:11434/v1"}}}}))
             config = {
                 "service_probe_hints": {
-                    "node-agent": {
+                    "llm-consumer": {
                         "bindings": {
                             "llm_provider": {"config_file": str(path), "json_path": "provider.ollama.options.baseURL"},
                         },
@@ -737,10 +717,10 @@ class InventoryReportTests(unittest.TestCase):
                     config, {}, {}, "2026-08-01T00:00:00+00:00", None,
                 )
 
-            self.assertIn("node-agent", observed)
-            self.assertEqual(observed["node-agent"]["source"], "probe")
-            self.assertEqual(observed["node-agent"]["bindings"]["llm_provider"]["configuration_status"], "present")
-            self.assertEqual(observed["node-agent"]["bindings"]["llm_provider"]["reachability_status"], "unreachable")
+            self.assertIn("llm-consumer", observed)
+            self.assertEqual(observed["llm-consumer"]["source"], "probe")
+            self.assertEqual(observed["llm-consumer"]["bindings"]["llm_provider"]["configuration_status"], "present")
+            self.assertEqual(observed["llm-consumer"]["bindings"]["llm_provider"]["reachability_status"], "unreachable")
 
     def test_no_file_content_ever_appears_in_a_managed_file_observation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
