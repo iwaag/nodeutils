@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import stat
@@ -823,6 +824,62 @@ class ObserveWorkspaceTests(unittest.TestCase):
         self.assertEqual(entry["present"], True)
         self.assertIn("head_sha", entry)
         self.assertNotIn("last_commit_at", entry)
+
+    def test_agent_status_is_absent_when_the_workspace_has_no_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entry = nodeutils_collect.observe_workspace({"path": tmpdir}, "2026-08-01T00:00:00+00:00")
+
+        self.assertNotIn("agent_status", entry)
+
+    def test_agent_status_is_read_with_a_locally_computed_age(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / ".local").mkdir()
+            written_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=42)
+            (path / ".local" / "agag-status.json").write_text(json.dumps({
+                "schema": "agag.status.v1",
+                "last_poll_ok": written_at.isoformat(),
+                "queue_id": "queue-1",
+                "last_error": None,
+            }))
+
+            entry = nodeutils_collect.observe_workspace({"path": str(path)}, "2026-08-01T00:00:00+00:00")
+
+        status = entry["agent_status"]
+        self.assertEqual(status["present"], True)
+        self.assertEqual(status["readable"], True)
+        self.assertEqual(status["queue_id"], "queue-1")
+        self.assertIsNone(status["last_error"])
+        # Locally computed, so a skewed node clock cancels rather than lying.
+        self.assertGreaterEqual(status["age_seconds"], 40)
+        self.assertLess(status["age_seconds"], 120)
+
+    def test_a_corrupt_or_foreign_status_file_is_unreadable_not_a_liveness_claim(self) -> None:
+        for content in ("{not json", json.dumps({"schema": "something.else"})):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir)
+                (path / ".local").mkdir()
+                (path / ".local" / "agag-status.json").write_text(content)
+
+                entry = nodeutils_collect.observe_workspace({"path": str(path)}, "2026-08-01T00:00:00+00:00")
+
+                self.assertEqual(entry["agent_status"], {
+                    "present": True, "readable": False, "checked_at": "2026-08-01T00:00:00+00:00",
+                })
+
+    def test_a_status_file_without_a_timestamp_reports_no_age(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / ".local").mkdir()
+            (path / ".local" / "agag-status.json").write_text(json.dumps({
+                "schema": "agag.status.v1", "last_poll_ok": None,
+                "queue_id": None, "last_error": "boom",
+            }))
+
+            entry = nodeutils_collect.observe_workspace({"path": str(path)}, "2026-08-01T00:00:00+00:00")
+
+        self.assertNotIn("age_seconds", entry["agent_status"])
+        self.assertEqual(entry["agent_status"]["last_error"], "boom")
 
     def test_workspace_probe_hints_ignores_malformed_entries(self) -> None:
         config = {"workspace_probe_hints": {"pj-example": {"path": "/x"}, "bad": "not-a-mapping"}}

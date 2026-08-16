@@ -1121,6 +1121,56 @@ def parse_git_status_v2(output: str) -> dict[str, Any]:
     return info
 
 
+AGENT_STATUS_RELATIVE_PATH = Path(".local") / "agag-status.json"
+AGENT_STATUS_SCHEMA = "agag.status.v1"
+AGENT_STATUS_MAX_BYTES = 64 * 1024
+
+
+def observe_agent_status(path: Path, collected_at: str) -> dict[str, Any] | None:
+    """Read a workspace's `agag-status.json`, or None when there is none.
+
+    agent_intent p1 step 4. The file is written by an agag listener only after
+    a Zulip poll that actually returned, so its freshness is the liveness
+    signal. `age_seconds` is computed here, on the node, against the same
+    clock the listener wrote with — remote clock skew therefore cancels
+    instead of being compared against Nautobot's clock.
+
+    Absent, oversized, unparsable, or foreign-schema files all read as "no
+    observation" rather than as an error or, worse, as a liveness claim.
+    """
+    try:
+        if path.stat().st_size > AGENT_STATUS_MAX_BYTES:
+            return {"present": True, "readable": False, "checked_at": collected_at}
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {"present": True, "readable": False, "checked_at": collected_at}
+    if not isinstance(document, dict) or document.get("schema") != AGENT_STATUS_SCHEMA:
+        return {"present": True, "readable": False, "checked_at": collected_at}
+
+    entry: dict[str, Any] = {
+        "present": True,
+        "readable": True,
+        "checked_at": collected_at,
+        "last_poll_ok": document.get("last_poll_ok"),
+        "queue_id": document.get("queue_id"),
+        "last_error": document.get("last_error"),
+    }
+    stamp = str(document.get("last_poll_ok") or "").strip().replace("Z", "+00:00")
+    if stamp:
+        try:
+            parsed = dt.datetime.fromisoformat(stamp)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            now = dt.datetime.now(dt.timezone.utc)
+            entry["age_seconds"] = max(0.0, round((now - parsed).total_seconds(), 3))
+    return entry
+
+
 def observe_workspace(hint: dict[str, Any], collected_at: str) -> dict[str, Any]:
     """Return one closed workspace observation, never raising.
 
@@ -1141,6 +1191,10 @@ def observe_workspace(hint: dict[str, Any], collected_at: str) -> dict[str, Any]
         entry["present"] = False
         return entry
     entry["present"] = True
+
+    agent_status = observe_agent_status(path / AGENT_STATUS_RELATIVE_PATH, collected_at)
+    if agent_status is not None:
+        entry["agent_status"] = agent_status
 
     raw: dict[str, Any] = {}
     if run_git(path, ["rev-parse", "--is-inside-work-tree"]) != "true":
