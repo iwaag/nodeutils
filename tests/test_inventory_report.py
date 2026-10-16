@@ -435,7 +435,7 @@ class InventoryReportTests(unittest.TestCase):
     def test_showmount_exports_macos_parses_the_header_away(self) -> None:
         completed = subprocess.CompletedProcess(
             args=["showmount", "-e", "localhost"], returncode=0,
-            stdout="Exports list on localhost:\n/srv/share 192.168.0.100 192.168.0.130\n/srv/other everyone\n",
+            stdout="Exports list on localhost:\n/srv/share 192.0.2.10 192.0.2.20\n/srv/other everyone\n",
         )
         with mock.patch.object(nodeutils_collect.subprocess, "run", return_value=completed):
             self.assertEqual(nodeutils_collect._showmount_exports_macos(), ["/srv/share", "/srv/other"])
