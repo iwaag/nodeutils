@@ -173,12 +173,37 @@ def _nfsd_serving() -> bool:
     return "nfsd" in _process_names()
 
 
-def nfs_export_status(path: str) -> dict[str, Any]:
-    """Whether this host's NFS server exports `path` (Linux kernel server)."""
+def _nfsd_running_macos() -> bool:
+    """Whether a macOS `nfsd` process is currently running."""
 
-    configured = _config_mentions(path, _nfs_export_config_files())
-    if platform.system() != "Linux":
-        return {"status": "error", "configured": configured, "detail": "nfs_export is observed on Linux only"}
+    try:
+        completed = subprocess.run(["pgrep", "-x", "nfsd"], check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _showmount_exports_macos() -> list[str]:
+    """Paths macOS's own mount daemon currently answers for (`showmount -e localhost`)."""
+
+    try:
+        completed = subprocess.run(
+            ["showmount", "-e", "localhost"], check=False, capture_output=True, text=True, timeout=8
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in completed.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("exports list"):
+            continue
+        paths.append(stripped.split()[0])
+    return paths
+
+
+def _nfs_export_status_linux(path: str, configured: bool) -> dict[str, Any]:
     running = "rpc.mountd" in _process_names() and _nfsd_serving()
     etab = read_text(NFS_ETAB) or ""
     exported = running and any(line.split()[0] == path for line in etab.splitlines() if line.strip())
@@ -191,6 +216,32 @@ def nfs_export_status(path: str) -> dict[str, Any]:
     else:
         status = "not_exported"
     return {"status": status, "configured": configured, "running": running, "exported": exported}
+
+
+def _nfs_export_status_macos(path: str, configured: bool) -> dict[str, Any]:
+    running = _nfsd_running_macos()
+    exported = running and path in _showmount_exports_macos()
+    if exported:
+        status = "present"
+    elif not configured:
+        status = "missing"
+    elif not running:
+        status = "not_running"
+    else:
+        status = "not_exported"
+    return {"status": status, "configured": configured, "running": running, "exported": exported}
+
+
+def nfs_export_status(path: str) -> dict[str, Any]:
+    """Whether this host's NFS server exports `path` (Linux kernel server or macOS `nfsd`)."""
+
+    configured = _config_mentions(path, _nfs_export_config_files())
+    system = platform.system()
+    if system == "Linux":
+        return _nfs_export_status_linux(path, configured)
+    if system == "Darwin":
+        return _nfs_export_status_macos(path, configured)
+    return {"status": "error", "configured": configured, "detail": f"nfs_export is not observed on {system}"}
 
 
 def _mount_table() -> list[tuple[str, str, str]]:

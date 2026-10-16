@@ -411,6 +411,59 @@ class InventoryReportTests(unittest.TestCase):
             self.assertEqual(result, {"status": "present", "configured": True, "running": True, "exported": True})
             self.assertEqual(nodeutils_collect.nfs_export_status("/srv/other")["status"], "missing")
 
+    def test_nfs_export_status_macos_separates_configured_running_and_exported(self) -> None:
+        # project_migration p6 ex1: macOS has no kernel export table/thread
+        # count to read, so `nfs_export` proves running/exported through
+        # `pgrep nfsd` and `showmount -e localhost` instead -- same four
+        # states as the Linux path.
+        files = {"/etc/exports": "# BEGIN nintent-a (nfs_server)\n/srv/share 10.0.0.5\n# END nintent-a (nfs_server)\n"}
+
+        with mock.patch.object(nodeutils_collect.platform, "system", return_value="Darwin"), \
+                mock.patch.object(nodeutils_collect, "_nfs_export_config_files", return_value=list(files)), \
+                mock.patch.object(nodeutils_collect, "read_text", side_effect=lambda name: files.get(name)), \
+                mock.patch.object(nodeutils_collect, "_nfsd_running_macos", side_effect=lambda: running), \
+                mock.patch.object(nodeutils_collect, "_showmount_exports_macos", side_effect=lambda: exports):
+            running, exports = False, []
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/share")["status"], "not_running")
+            running, exports = True, []
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/share")["status"], "not_exported")
+            running, exports = True, ["/srv/share"]
+            result = nodeutils_collect.nfs_export_status("/srv/share")
+            self.assertEqual(result, {"status": "present", "configured": True, "running": True, "exported": True})
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/other")["status"], "missing")
+
+    def test_showmount_exports_macos_parses_the_header_away(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["showmount", "-e", "localhost"], returncode=0,
+            stdout="Exports list on localhost:\n/srv/share 192.168.0.100 192.168.0.130\n/srv/other everyone\n",
+        )
+        with mock.patch.object(nodeutils_collect.subprocess, "run", return_value=completed):
+            self.assertEqual(nodeutils_collect._showmount_exports_macos(), ["/srv/share", "/srv/other"])
+
+    def test_showmount_exports_macos_is_empty_when_the_daemon_is_unreachable(self) -> None:
+        with mock.patch.object(nodeutils_collect.subprocess, "run", side_effect=OSError):
+            self.assertEqual(nodeutils_collect._showmount_exports_macos(), [])
+        failed = subprocess.CompletedProcess(args=["showmount"], returncode=1, stdout="")
+        with mock.patch.object(nodeutils_collect.subprocess, "run", return_value=failed):
+            self.assertEqual(nodeutils_collect._showmount_exports_macos(), [])
+
+    def test_nfsd_running_macos_reads_pgrep(self) -> None:
+        with mock.patch.object(nodeutils_collect.subprocess, "run",
+                                return_value=subprocess.CompletedProcess(args=["pgrep"], returncode=0)):
+            self.assertTrue(nodeutils_collect._nfsd_running_macos())
+        with mock.patch.object(nodeutils_collect.subprocess, "run",
+                                return_value=subprocess.CompletedProcess(args=["pgrep"], returncode=1)):
+            self.assertFalse(nodeutils_collect._nfsd_running_macos())
+        with mock.patch.object(nodeutils_collect.subprocess, "run", side_effect=subprocess.TimeoutExpired("pgrep", 5)):
+            self.assertFalse(nodeutils_collect._nfsd_running_macos())
+
+    def test_nfs_export_status_is_an_error_on_an_unsupported_os(self) -> None:
+        with mock.patch.object(nodeutils_collect.platform, "system", return_value="Windows"), \
+                mock.patch.object(nodeutils_collect, "_nfs_export_config_files", return_value=[]):
+            result = nodeutils_collect.nfs_export_status("/srv/share")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Windows", result["detail"])
+
     def test_nfs_mount_status_needs_mounted_and_listable(self) -> None:
         with mock.patch.object(nodeutils_collect, "_nfs_mount_config_files", return_value=["/etc/fstab"]), \
                 mock.patch.object(nodeutils_collect, "read_text",
