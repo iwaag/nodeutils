@@ -103,7 +103,156 @@ def run_command(command: list[str], timeout: int = 8) -> str | None:
 # Executor-side copy of the state-proof check kinds (nctl's
 # `reconcile.profiles.EXISTENCE_PROOF_CHECK_KINDS`): a failed result of any
 # of these creates/keeps the observed entry with `state: missing`.
-EXISTENCE_PROOF_CHECK_KINDS = ("file_exists", "cron_registered")
+EXISTENCE_PROOF_CHECK_KINDS = ("file_exists", "cron_registered", "nfs_export", "nfs_mount")
+
+# project_migration p6: an NFS export or mount is four separate facts --
+# configured (a config file names the path), running (the kernel server is up),
+# mounted/exported (the kernel says so now) and usable (a bounded listing as
+# the collecting user returned). Only `present` means all of them held; every
+# other status names the first one that did not.
+NFS_EXPORT_CONFIG_FILES = ("/etc/exports",)
+NFS_EXPORT_CONFIG_DIRS = ("/etc/exports.d",)
+NFS_MOUNT_CONFIG_FILES = ("/etc/fstab",)
+NFS_MOUNT_CONFIG_GLOB_DIR = "/etc"  # macOS automounter maps: /etc/auto_*
+# rpc.mountd answers the kernel's export queries from etab (the kernel's own
+# table fills only on demand); nfsd's thread count says whether it serves.
+NFS_ETAB = "/var/lib/nfs/etab"
+NFS_THREADS = "/proc/fs/nfsd/threads"
+NFS_LIST_TIMEOUT_SECONDS = 10.0
+
+
+def _config_mentions(path: str, files: list[str]) -> bool:
+    for name in files:
+        text = read_text(name)
+        if not text:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if path in stripped.split():
+                return True
+    return False
+
+
+def _nfs_export_config_files() -> list[str]:
+    files = list(NFS_EXPORT_CONFIG_FILES)
+    for directory in NFS_EXPORT_CONFIG_DIRS:
+        try:
+            files.extend(str(p) for p in sorted(Path(directory).glob("*.exports")))
+        except OSError:
+            continue
+    return files
+
+
+def _nfs_mount_config_files() -> list[str]:
+    files = list(NFS_MOUNT_CONFIG_FILES)
+    try:
+        files.extend(str(p) for p in sorted(Path(NFS_MOUNT_CONFIG_GLOB_DIR).glob("auto_*")))
+    except OSError:
+        pass
+    return files
+
+
+def _process_names() -> set[str]:
+    names: set[str] = set()
+    for comm in Path("/proc").glob("[0-9]*/comm"):
+        try:
+            names.add(comm.read_text().strip())
+        except OSError:
+            continue
+    return names
+
+
+def _nfsd_serving() -> bool:
+    """nfsd's thread count when readable (root only), else its kernel threads."""
+
+    threads = (read_text(NFS_THREADS) or "").strip()
+    if threads.isdigit():
+        return int(threads) > 0
+    return "nfsd" in _process_names()
+
+
+def nfs_export_status(path: str) -> dict[str, Any]:
+    """Whether this host's NFS server exports `path` (Linux kernel server)."""
+
+    configured = _config_mentions(path, _nfs_export_config_files())
+    if platform.system() != "Linux":
+        return {"status": "error", "configured": configured, "detail": "nfs_export is observed on Linux only"}
+    running = "rpc.mountd" in _process_names() and _nfsd_serving()
+    etab = read_text(NFS_ETAB) or ""
+    exported = running and any(line.split()[0] == path for line in etab.splitlines() if line.strip())
+    if exported:
+        status = "present"
+    elif not configured:
+        status = "missing"
+    elif not running:
+        status = "not_running"
+    else:
+        status = "not_exported"
+    return {"status": status, "configured": configured, "running": running, "exported": exported}
+
+
+def _mount_table() -> list[tuple[str, str, str]]:
+    """(source, mount point, fstype) rows of the current mount table."""
+
+    rows: list[tuple[str, str, str]] = []
+    if platform.system() == "Linux":
+        for line in (read_text("/proc/self/mounts") or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                rows.append((parts[0], parts[1].replace("\\040", " "), parts[2]))
+        return rows
+    try:
+        completed = subprocess.run(["mount"], check=False, capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return rows
+    for line in completed.stdout.splitlines():
+        match = re.match(r"^(.+?) on (.+?) \(([^,)]+)", line)
+        if match:
+            rows.append((match.group(1), match.group(2), match.group(3)))
+    return rows
+
+
+def _bounded_listing(path: str, timeout: float) -> str:
+    """List `path` in a child process so a dead server cannot hang the collector."""
+
+    try:
+        child = subprocess.Popen(["ls", "-1A", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return "error"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        code = child.poll()
+        if code is not None:
+            return "listable" if code == 0 else "unlistable"
+        time.sleep(0.1)
+    try:
+        child.kill()  # a process blocked on a hard mount may not die; never wait for it
+    except OSError:
+        pass
+    return "timeout"
+
+
+def nfs_mount_status(path: str, timeout: float = NFS_LIST_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Whether `path` is a configured, mounted and listable NFS mount for this user.
+
+    The listing comes first: on an automounted path it is what mounts it, so
+    the mount table is read after it.
+    """
+
+    configured = _config_mentions(path, _nfs_mount_config_files())
+    if not configured:
+        return {"status": "missing", "configured": False}
+    access = _bounded_listing(path, timeout)
+    mounted = any(point == path and fstype.startswith("nfs") for _source, point, fstype in _mount_table())
+    if not mounted:
+        status = "unreachable" if access == "timeout" else "unmounted"
+    elif access != "listable":
+        status = "unusable"
+    else:
+        status = "present"
+    return {"status": status, "configured": True, "mounted": mounted, "access": access}
 
 
 def crontab_registration_status(expanded_path: str, raw_path: str | None = None) -> str:
@@ -1503,6 +1652,13 @@ def normalize_observed_services(
                 status = crontab_registration_status(expanded, raw_path=path)
                 proof_failed = proof_failed or status != "present"
                 check_results.append({"kind": "cron_registered", "path": expanded, "status": status})
+            elif kind in ("nfs_export", "nfs_mount"):
+                path = check.get("path")
+                if not isinstance(path, str) or not path:
+                    continue
+                result = nfs_export_status(path) if kind == "nfs_export" else nfs_mount_status(path)
+                proof_failed = proof_failed or result["status"] != "present"
+                check_results.append({"kind": kind, "path": path, **result})
             elif kind == "http":
                 endpoint = hint.get("endpoint")
                 paths = check.get("paths")

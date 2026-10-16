@@ -380,6 +380,71 @@ class InventoryReportTests(unittest.TestCase):
             self.assertEqual(observed["heartbeat-cron"]["state"], "missing")
             self.assertEqual(observed["heartbeat-cron"]["checks"][1]["status"], "missing")
 
+    def test_nfs_export_status_separates_configured_running_and_exported(self) -> None:
+        # project_migration p6: a declared export is not proof the server
+        # exports it. Each missing fact gets its own status.
+        files = {"/etc/exports": "# none\n", "/etc/exports.d/nintent-a.exports": "/srv/share 10.0.0.0/24(rw)\n"}
+
+        def fake_read(name: str) -> str | None:
+            if name == nodeutils_collect.NFS_THREADS:
+                return threads
+            if name == nodeutils_collect.NFS_ETAB:
+                return etab
+            return files.get(name)
+
+        processes = {"rpc.mountd"}
+        with mock.patch.object(nodeutils_collect.platform, "system", return_value="Linux"), \
+                mock.patch.object(nodeutils_collect, "_nfs_export_config_files", return_value=list(files)), \
+                mock.patch.object(nodeutils_collect, "_process_names", side_effect=lambda: processes), \
+                mock.patch.object(nodeutils_collect, "read_text", side_effect=fake_read):
+            threads, etab = None, "/srv/share\t*(rw)\n"
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/share")["status"], "not_running")
+            processes = {"rpc.mountd", "nfsd"}  # threads unreadable as a user: kernel threads count
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/share")["status"], "present")
+            processes, etab = {"rpc.mountd"}, ""
+            threads = "0\n"
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/share")["status"], "not_running")
+            threads = "8\n"
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/share")["status"], "not_exported")
+            etab = "/srv/share\t10.0.0.0/24(rw,sync,all_squash)\n"
+            result = nodeutils_collect.nfs_export_status("/srv/share")
+            self.assertEqual(result, {"status": "present", "configured": True, "running": True, "exported": True})
+            self.assertEqual(nodeutils_collect.nfs_export_status("/srv/other")["status"], "missing")
+
+    def test_nfs_mount_status_needs_mounted_and_listable(self) -> None:
+        with mock.patch.object(nodeutils_collect, "_nfs_mount_config_files", return_value=["/etc/fstab"]), \
+                mock.patch.object(nodeutils_collect, "read_text",
+                                  return_value="srv:/srv/share /mnt/share nfs rw,x-systemd.automount 0 0\n"):
+            cases = [
+                ([("systemd-1", "/mnt/share", "autofs"), ("srv:/srv/share", "/mnt/share", "nfs4")], "listable", "present"),
+                ([("systemd-1", "/mnt/share", "autofs")], "timeout", "unreachable"),
+                ([("systemd-1", "/mnt/share", "autofs")], "unlistable", "unmounted"),
+                ([("srv:/srv/share", "/mnt/share", "nfs")], "unlistable", "unusable"),
+            ]
+            for table, access, expected in cases:
+                with mock.patch.object(nodeutils_collect, "_mount_table", return_value=table), \
+                        mock.patch.object(nodeutils_collect, "_bounded_listing", return_value=access):
+                    self.assertEqual(nodeutils_collect.nfs_mount_status("/mnt/share")["status"], expected, (table, access))
+            self.assertEqual(nodeutils_collect.nfs_mount_status("/mnt/elsewhere"), {"status": "missing", "configured": False})
+
+    def test_nfs_checks_are_state_proofs(self) -> None:
+        hints = {"service_probe_hints": {"share-client": {"checks": [{"kind": "nfs_mount", "path": "/mnt/share"}]}}}
+        with mock.patch.object(nodeutils_collect, "nfs_mount_status",
+                               return_value={"status": "unmounted", "configured": True, "mounted": False, "access": "unlistable"}):
+            observed = nodeutils_collect.normalize_observed_services(hints, {}, {}, "2026-10-16T00:00:00+00:00", None)
+        self.assertEqual(observed["share-client"]["state"], "missing")
+        self.assertEqual(observed["share-client"]["source"], "check:nfs_mount")
+        self.assertEqual(observed["share-client"]["checks"][0]["status"], "unmounted")
+        with mock.patch.object(nodeutils_collect, "nfs_mount_status",
+                               return_value={"status": "present", "configured": True, "mounted": True, "access": "listable"}):
+            observed = nodeutils_collect.normalize_observed_services(hints, {}, {}, "2026-10-16T00:00:00+00:00", None)
+        self.assertEqual(observed["share-client"]["state"], "present")
+
+    def test_bounded_listing_reports_a_real_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(nodeutils_collect._bounded_listing(tmpdir, 5.0), "listable")
+            self.assertEqual(nodeutils_collect._bounded_listing(str(Path(tmpdir) / "absent"), 5.0), "unlistable")
+
     def test_cron_registered_check_expands_home_and_keeps_raw_needle(self) -> None:
         with mock.patch.object(
             nodeutils_collect, "crontab_registration_status", return_value="present"
