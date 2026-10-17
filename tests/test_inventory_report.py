@@ -3,9 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -497,6 +499,42 @@ class InventoryReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             self.assertEqual(nodeutils_collect._bounded_listing(tmpdir, 5.0), "listable")
             self.assertEqual(nodeutils_collect._bounded_listing(str(Path(tmpdir) / "absent"), 5.0), "unlistable")
+
+    def test_bounded_listing_times_out_and_kills_a_blocked_child(self) -> None:
+        # A test-owned executable stands in for ls and blocks in userspace.
+        # This verifies the collector's deadline/kill path without mounting or
+        # touching any NFS share.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bindir = Path(tmpdir) / "bin"
+            bindir.mkdir()
+            fake_ls = bindir / "ls"
+            fake_ls.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+            fake_ls.chmod(0o755)
+            env_path = os.environ.get("PATH", "")
+            with mock.patch.dict(os.environ, {"PATH": f"{bindir}:{env_path}"}):
+                started = time.monotonic()
+                self.assertEqual(nodeutils_collect._bounded_listing("/unused", 0.25), "timeout")
+                elapsed = time.monotonic() - started
+            self.assertGreaterEqual(elapsed, 0.2)
+            self.assertLess(elapsed, 2.0, "collector wait must remain bounded")
+
+    def test_mounted_nfs_timeout_is_unusable_and_stays_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bindir = Path(tmpdir) / "bin"
+            bindir.mkdir()
+            fake_ls = bindir / "ls"
+            fake_ls.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+            fake_ls.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{bindir}:{os.environ.get('PATH', '')}"}), \
+                    mock.patch.object(nodeutils_collect, "_config_mentions", return_value=True), \
+                    mock.patch.object(nodeutils_collect, "_nfs_mount_config_files", return_value=["/etc/fstab"]), \
+                    mock.patch.object(nodeutils_collect, "_mount_table", return_value=[("server:/share", "/mnt/share", "nfs4")]):
+                started = time.monotonic()
+                result = nodeutils_collect.nfs_mount_status("/mnt/share", timeout=0.25)
+                elapsed = time.monotonic() - started
+            self.assertEqual(result, {"status": "unusable", "configured": True,
+                                      "mounted": True, "access": "timeout"})
+            self.assertLess(elapsed, 2.0, "mounted NFS timeout must not hold collection open")
 
     def test_cron_registered_check_expands_home_and_keeps_raw_needle(self) -> None:
         with mock.patch.object(

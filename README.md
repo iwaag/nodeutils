@@ -171,6 +171,15 @@ never serializes the file content. The checked-in `tests/fixtures/dnsmasq-v5-gol
 is shared byte-for-byte with nctl's fixture; both projects independently verify
 its SHA-256 (`c25e51c4efce07281e580dcfb1ecad73d666a70310f87cd28ad448241215e592`).
 
+NFS mount usability checks list the configured path in a child process with a
+10-second collector deadline, then inspect the local mount table. A mounted
+path whose listing fails or times out is reported as unusable. On timeout the
+collector sends the child a kill signal without waiting for it: a process
+blocked in uninterruptible kernel sleep may persist after collection returns.
+The timeout bounds the collector's wait; it does not guarantee the child has
+exited or recover the mount. A fresh observation is required to assess current
+usability, and desired-state convergence alone is not proof that NFS I/O works.
+
 ## Scheduled Run Example
 
 Ubuntu cron example:
